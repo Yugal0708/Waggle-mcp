@@ -250,14 +250,14 @@ Corpus: 24 multi-session scenarios, 66 retrieval queries across 7 task families 
 
 | Task family | Queries | Waggle Hit@k | RAG Hit@k |
 |-------------|---------|-------------|----------|
-| `factual_recall` | 18 | 100% | 100% |
-| `temporal_original` | 19 | 89% | 100% |
-| `multi_session_change` | 11 | 91% | 100% |
-| `cross_scenario_synthesis` | 8 | 100% | 100% |
-| `decision_delta` | 4 | 100% | 100% |
-| `adversarial_paraphrase` | 4 | 50% | 100% |
-| `temporal_latest` | 2 | 50% | 100% |
-| **Overall** | **66** | **91%** | **100%** |
+| `factual_recall` | 18 | 18/18 = 100% | 100% |
+| `temporal_original` | 19 | 17/19 = 89% | 100% |
+| `multi_session_change` | 11 | 10/11 = 91% | 100% |
+| `cross_scenario_synthesis` | 8 | 8/8 = 100% | 100% |
+| `decision_delta` | 4 *(small n)* | 4/4 = 100% | 100% |
+| `adversarial_paraphrase` | 4 *(small n)* | 2/4 = 50% | 100% |
+| `temporal_latest` | 2 *(small n)* | 1/2 = 50% | 100% |
+| **Overall** | **66** | **60/66 = 91%** | **100%** |
 
 | System | Mean tokens | Median tokens | p95 tokens | Hit@k | Exact support |
 |--------|-------------|---------------|------------|-------|---------------|
@@ -266,7 +266,10 @@ Corpus: 24 multi-session scenarios, 66 retrieval queries across 7 task families 
 
 **Waggle uses ~4× fewer tokens per retrieval** than the naive chunked baseline on this corpus.
 
-The tradeoff is honest: the chunked baseline achieves 100% Hit@k on this corpus because at `top_k=5` every fact is retrievable from its own session chunk. The token efficiency advantage is real and reproducible; the retrieval superiority claim requires a harder corpus where facts must be synthesised across sessions without guaranteed chunk coverage. Corpus hardening is ongoing.
+The gap between Waggle's Hit@k (91%) and exact support (74%) indicates that graph retrieval finds the right topic but sometimes returns insufficient supporting detail — most visibly on `cross_scenario_synthesis` queries (8/8 hit, 1/8 exact). Improving context assembly — specifically edge traversal depth and multi-hop subgraph expansion — is a tracked next step.
+
+The tradeoff is honest: the chunked baseline achieves 100% Hit@k on this corpus because at `top_k=5` every fact is retrievable from its own session chunk. The token efficiency advantage is real and reproducible; the retrieval superiority claim requires a corpus where chunk coverage can't compensate for missing relational context. Corpus hardening is ongoing.
+
 
 ### When extraction fails
 
