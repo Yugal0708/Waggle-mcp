@@ -94,7 +94,7 @@
   <circle cx="60" cy="19" r="6" class="dot3"/>
 
   <!-- window title -->
-  <text x="380" y="24" text-anchor="middle" class="gray" font-size="12">graph-memory-mcp — demo</text>
+  <text x="380" y="24" text-anchor="middle" class="gray" font-size="12">waggle-mcp — demo</text>
 
   <!-- ── terminal lines ── -->
   <!-- y=38 is the chrome bottom; first line at y=62 (24px line-height) -->
@@ -113,14 +113,14 @@
     <tspan class="muted">@mbp</tspan>
     <tspan class="muted"> ~ </tspan>
     <tspan class="prompt">❯ </tspan>
-    <tspan class="cmd">graph-memory-mcp init</tspan>
+    <tspan class="cmd">waggle-mcp init</tspan>
   </text>
 
   <!-- line 2: blank -->
   <text x="20" y="92" class="line l2 white"> </text>
 
   <!-- line 3: wizard banner -->
-  <text x="20" y="116" class="line l3 white" font-weight="bold">graph-memory-mcp setup wizard</text>
+  <text x="20" y="116" class="line l3 white" font-weight="bold">waggle-mcp setup wizard</text>
 
   <!-- line 4: divider -->
   <text x="20" y="140" class="line l4 cyan">────────────────────────────────────────</text>
