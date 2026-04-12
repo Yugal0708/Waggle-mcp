@@ -301,7 +301,9 @@ Full threshold sweep and detailed methodology: [`tests/artifacts/README.md`](./t
 
 </details>
 
-> Full artifacts, methodology, and rag_tuned comparison: [`tests/artifacts/README.md`](./tests/artifacts/README.md)
+> Full artifacts, methodology, and rag_tuned comparison: [`tests/artifacts/README.md`](./tests/artifacts/README.md)  
+> Improvement roadmap (dedup → context assembly → corpus hardening): [`docs/evaluation-plan.md`](./docs/evaluation-plan.md)
+
 
 
 ---
