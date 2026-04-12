@@ -11,9 +11,9 @@ from uuid import uuid4
 import networkx as nx
 import numpy as np
 
-from graph_memory.auth import generate_api_key, hash_api_key, verify_api_key
-from graph_memory.errors import AuthenticationError, ValidationFailure
-from graph_memory.intelligence import (
+from waggle.auth import generate_api_key, hash_api_key, verify_api_key
+from waggle.errors import AuthenticationError, ValidationFailure
+from waggle.intelligence import (
     compatible_node_types,
     detect_conflict_reason,
     extract_conversation_candidates,
@@ -33,7 +33,7 @@ from graph_memory.intelligence import (
     tokenize_text,
     within_time_window,
 )
-from graph_memory.models import (
+from waggle.models import (
     ApiKeyCreateResult,
     ApiKeyRecord,
     BackupResult,
@@ -132,43 +132,43 @@ class Neo4jMemoryGraph:
         with self._lock, self._session() as session:
             session.run(
                 """
-                CREATE CONSTRAINT graph_memory_node_id IF NOT EXISTS
+                CREATE CONSTRAINT waggle_node_id IF NOT EXISTS
                 FOR (n:MemoryNode) REQUIRE n.id IS UNIQUE
                 """
             ).consume()
             session.run(
                 """
-                CREATE CONSTRAINT graph_memory_edge_id IF NOT EXISTS
+                CREATE CONSTRAINT waggle_edge_id IF NOT EXISTS
                 FOR ()-[r:MEMORY_EDGE]-() REQUIRE r.id IS UNIQUE
                 """
             ).consume()
             session.run(
                 """
-                CREATE CONSTRAINT graph_memory_tenant_id IF NOT EXISTS
+                CREATE CONSTRAINT waggle_tenant_id IF NOT EXISTS
                 FOR (t:GraphTenant) REQUIRE t.tenant_id IS UNIQUE
                 """
             ).consume()
             session.run(
                 """
-                CREATE CONSTRAINT graph_memory_api_key_id IF NOT EXISTS
+                CREATE CONSTRAINT waggle_api_key_id IF NOT EXISTS
                 FOR (a:GraphApiKey) REQUIRE a.api_key_id IS UNIQUE
                 """
             ).consume()
             session.run(
                 """
-                CREATE INDEX graph_memory_node_tenant_updated IF NOT EXISTS
+                CREATE INDEX waggle_node_tenant_updated IF NOT EXISTS
                 FOR (n:MemoryNode) ON (n.tenant_id, n.updated_at)
                 """
             ).consume()
             session.run(
                 """
-                CREATE INDEX graph_memory_node_tenant_type IF NOT EXISTS
+                CREATE INDEX waggle_node_tenant_type IF NOT EXISTS
                 FOR (n:MemoryNode) ON (n.tenant_id, n.node_type)
                 """
             ).consume()
             session.run(
                 """
-                CREATE INDEX graph_memory_api_key_hash IF NOT EXISTS
+                CREATE INDEX waggle_api_key_hash IF NOT EXISTS
                 FOR (a:GraphApiKey) ON (a.key_hash)
                 """
             ).consume()
@@ -795,7 +795,7 @@ class Neo4jMemoryGraph:
         if output_path is None:
             self.export_dir.mkdir(parents=True, exist_ok=True)
             timestamp = utc_now().strftime("%Y%m%d-%H%M%S")
-            destination = self.export_dir / f"graph-memory-{timestamp}.html"
+            destination = self.export_dir / f"waggle-{timestamp}.html"
         else:
             destination = Path(output_path).expanduser()
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -859,7 +859,7 @@ class Neo4jMemoryGraph:
         if output_path is None:
             self.export_dir.mkdir(parents=True, exist_ok=True)
             timestamp = utc_now().strftime("%Y%m%d-%H%M%S")
-            destination = self.export_dir / f"graph-memory-backup-{timestamp}.json"
+            destination = self.export_dir / f"waggle-backup-{timestamp}.json"
         else:
             destination = Path(output_path).expanduser()
             destination.parent.mkdir(parents=True, exist_ok=True)

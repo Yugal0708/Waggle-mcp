@@ -4,8 +4,8 @@ from pathlib import Path
 
 import numpy as np
 
-from graph_memory.graph import MemoryGraph
-from graph_memory.models import NodeType, RelationType
+from waggle.graph import MemoryGraph
+from waggle.models import NodeType, RelationType
 
 
 class FakeEmbeddingModel:

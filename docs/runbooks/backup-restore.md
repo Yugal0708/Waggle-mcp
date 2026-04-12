@@ -1,7 +1,7 @@
 # Runbook: Backup and Restore
 
 **Audience:** Platform team / on-call engineer  
-**Applies to:** graph-memory-mcp (both SQLite and Neo4j backends)  
+**Applies to:** waggle-mcp (both SQLite and Neo4j backends)  
 **Last reviewed:** 2026-04-12
 
 ---
@@ -22,7 +22,7 @@ Use the automated drill script for routine validation:
 ### Via MCP tool (HTTP mode)
 
 ```bash
-BASE=https://graph-memory.example.com
+BASE=https://waggle.example.com
 API_KEY=<your-raw-key>
 BACKUP_FILE="backup-$(date +%Y%m%d-%H%M%S).json"
 
@@ -33,18 +33,18 @@ curl -s -X POST "$BASE/mcp" \
   | jq .
 
 # Copy the backup out of the pod
-kubectl cp graph-memory-<pod>:/app/tmp/$BACKUP_FILE ./$BACKUP_FILE
+kubectl cp waggle-<pod>:/app/tmp/$BACKUP_FILE ./$BACKUP_FILE
 ```
 
 ### Via Python script (direct, for SQLite)
 
 ```bash
-GRAPH_MEMORY_BACKEND=sqlite \
-GRAPH_MEMORY_DB_PATH=./memory.db \
-GRAPH_MEMORY_DEFAULT_TENANT_ID=local-default \
+WAGGLE_BACKEND=sqlite \
+WAGGLE_DB_PATH=./memory.db \
+WAGGLE_DEFAULT_TENANT_ID=local-default \
   python -c "
-from graph_memory.graph import MemoryGraph
-from graph_memory.embeddings import EmbeddingModel
+from waggle.graph import MemoryGraph
+from waggle.embeddings import EmbeddingModel
 g = MemoryGraph('memory.db', EmbeddingModel('all-MiniLM-L6-v2'), tenant_id='local-default')
 r = g.export_graph_backup('backup.json')
 print(f'Exported {r.node_count} nodes and {r.edge_count} edges')
@@ -63,12 +63,12 @@ print(f'Exported {r.node_count} nodes and {r.edge_count} edges')
 > ```
 
 ```bash
-BASE=https://graph-memory.example.com
+BASE=https://waggle.example.com
 API_KEY=<your-raw-key>
 BACKUP_FILE=backup-20260412-120000.json
 
 # Upload the backup file into the pod
-kubectl cp $BACKUP_FILE graph-memory-<pod>:/app/tmp/$BACKUP_FILE
+kubectl cp $BACKUP_FILE waggle-<pod>:/app/tmp/$BACKUP_FILE
 
 # Trigger import via MCP tool
 curl -s -X POST "$BASE/mcp" \
@@ -103,8 +103,8 @@ Run the automated end-to-end drill (requires a running HTTP server):
 
 ```bash
 # Minimal
-GRAPH_MEMORY_HOST=http://localhost:8080 \
-GRAPH_MEMORY_API_KEY=<key> \
+WAGGLE_HOST=http://localhost:8080 \
+WAGGLE_API_KEY=<key> \
   ./scripts/backup_restore_drill.sh
 
 # With JSON output for CI

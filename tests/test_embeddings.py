@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from graph_memory.embeddings import EmbeddingModel
+from waggle.embeddings import EmbeddingModel
 
 
 def test_embedding_bytes_round_trip() -> None:

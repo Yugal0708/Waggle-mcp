@@ -16,7 +16,7 @@ class RuntimeContext:
 
 
 _runtime_context: contextvars.ContextVar[RuntimeContext] = contextvars.ContextVar(
-    "graph_memory_runtime_context",
+    "waggle_runtime_context",
     default=RuntimeContext(),
 )
 

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
-from graph_memory.models import Node, NodeType, RelationType, utc_now
+from waggle.models import Node, NodeType, RelationType, utc_now
 
 _STOPWORDS = {
     "a",

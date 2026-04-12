@@ -69,7 +69,7 @@ class DrillReport:
 
     def print_text(self) -> None:
         print("=" * 56)
-        print(f"  graph-memory-mcp Backup/Restore Drill")
+        print(f"  waggle-mcp Backup/Restore Drill")
         print(f"  Host: {self.host}")
         print("=" * 56)
         for c in self.checks:
@@ -192,7 +192,7 @@ def run(args: argparse.Namespace) -> DrillReport:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="graph-memory-mcp backup/restore drill")
+    parser = argparse.ArgumentParser(description="waggle-mcp backup/restore drill")
     parser.add_argument("--host", default="http://localhost:8080")
     parser.add_argument("--api-key", required=True, dest="api_key")
     parser.add_argument("--json", action="store_true", dest="as_json",

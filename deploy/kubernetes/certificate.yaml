@@ -42,17 +42,17 @@ spec:
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: graph-memory-tls
+  name: waggle-tls
 spec:
-  secretName: graph-memory-tls
+  secretName: waggle-tls
   # Switch issuerRef.name to letsencrypt-prod when ready.
   issuerRef:
     name: letsencrypt-staging
     kind: ClusterIssuer
-  commonName: graph-memory.example.com
+  commonName: waggle.example.com
   dnsNames:
     # Replace with your real hostname(s).
-    - graph-memory.example.com
+    - waggle.example.com
   # cert-manager will auto-renew 30 days before expiry.
   duration: 2160h   # 90 days
   renewBefore: 720h # 30 days

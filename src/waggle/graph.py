@@ -12,10 +12,10 @@ from uuid import uuid4
 import networkx as nx
 import numpy as np
 
-from graph_memory.auth import generate_api_key, hash_api_key, verify_api_key
-from graph_memory.embeddings import EmbeddingModel
-from graph_memory.errors import AuthenticationError, ValidationFailure
-from graph_memory.intelligence import (
+from waggle.auth import generate_api_key, hash_api_key, verify_api_key
+from waggle.embeddings import EmbeddingModel
+from waggle.errors import AuthenticationError, ValidationFailure
+from waggle.intelligence import (
     compatible_node_types,
     detect_conflict_reason,
     extract_conversation_candidates,
@@ -35,7 +35,7 @@ from graph_memory.intelligence import (
     tokenize_text,
     within_time_window,
 )
-from graph_memory.models import (
+from waggle.models import (
     ApiKeyCreateResult,
     ApiKeyRecord,
     BackupResult,
@@ -772,7 +772,7 @@ class MemoryGraph:
         if output_path is None:
             self.export_dir.mkdir(parents=True, exist_ok=True)
             timestamp = utc_now().strftime("%Y%m%d-%H%M%S")
-            destination = self.export_dir / f"graph-memory-{timestamp}.html"
+            destination = self.export_dir / f"waggle-{timestamp}.html"
         else:
             destination = Path(output_path).expanduser()
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -843,7 +843,7 @@ class MemoryGraph:
         if output_path is None:
             self.export_dir.mkdir(parents=True, exist_ok=True)
             timestamp = utc_now().strftime("%Y%m%d-%H%M%S")
-            destination = self.export_dir / f"graph-memory-backup-{timestamp}.json"
+            destination = self.export_dir / f"waggle-backup-{timestamp}.json"
         else:
             destination = Path(output_path).expanduser()
             destination.parent.mkdir(parents=True, exist_ok=True)

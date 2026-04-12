@@ -1,7 +1,7 @@
 """Persistent graph memory MCP server."""
 
-from graph_memory.graph import MemoryGraph
-from graph_memory.models import (
+from waggle.graph import MemoryGraph
+from waggle.models import (
     ApiKeyCreateResult,
     ApiKeyRecord,
     BackupResult,
@@ -23,7 +23,7 @@ from graph_memory.models import (
 )
 
 try:  # pragma: no cover
-    from graph_memory.neo4j_graph import Neo4jMemoryGraph
+    from waggle.neo4j_graph import Neo4jMemoryGraph
 except Exception:  # pragma: no cover
     Neo4jMemoryGraph = None
 

@@ -7,8 +7,8 @@ import secrets
 from dataclasses import dataclass
 from datetime import datetime
 
-from graph_memory.errors import AuthenticationError
-from graph_memory.models import ApiKeyRecord
+from waggle.errors import AuthenticationError
+from waggle.models import ApiKeyRecord
 
 
 def hash_api_key(raw_api_key: str) -> str:

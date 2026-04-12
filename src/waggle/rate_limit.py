@@ -5,7 +5,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
-from graph_memory.errors import RateLimitExceededError
+from waggle.errors import RateLimitExceededError
 
 
 class RateLimiter:

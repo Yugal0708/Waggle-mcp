@@ -5,7 +5,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 
-from graph_memory.runtime_context import get_runtime_context
+from waggle.runtime_context import get_runtime_context
 
 
 class JsonLogFormatter(logging.Formatter):

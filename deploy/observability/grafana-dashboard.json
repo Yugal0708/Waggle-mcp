@@ -51,7 +51,7 @@
       "id": 1,
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "textMode": "auto", "colorMode": "background" },
       "targets": [
-        { "expr": "graph_memory_ready", "legendFormat": "Ready", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" } }
+        { "expr": "waggle_ready", "legendFormat": "Ready", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" } }
       ],
       "title": "Service Ready",
       "type": "stat"
@@ -63,7 +63,7 @@
       "id": 2,
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
       "targets": [
-        { "expr": "graph_memory_graph_nodes", "legendFormat": "Nodes ({{tenant_id}})", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" } }
+        { "expr": "waggle_graph_nodes", "legendFormat": "Nodes ({{tenant_id}})", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" } }
       ],
       "title": "Total Graph Nodes",
       "type": "stat"
@@ -75,7 +75,7 @@
       "id": 3,
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
       "targets": [
-        { "expr": "graph_memory_graph_edges", "legendFormat": "Edges ({{tenant_id}})", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" } }
+        { "expr": "waggle_graph_edges", "legendFormat": "Edges ({{tenant_id}})", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" } }
       ],
       "title": "Total Graph Edges",
       "type": "stat"
@@ -87,7 +87,7 @@
       "id": 4,
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
       "targets": [
-        { "expr": "rate(graph_memory_tool_requests_total[1m])", "legendFormat": "RPS", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" } }
+        { "expr": "rate(waggle_tool_requests_total[1m])", "legendFormat": "RPS", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" } }
       ],
       "title": "Requests / sec",
       "type": "stat"
@@ -99,7 +99,7 @@
       "id": 5,
       "options": { "reduceOptions": { "calcs": ["sum"] } },
       "targets": [
-        { "expr": "increase(graph_memory_auth_failures_total[5m])", "legendFormat": "Auth failures (5m)", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" } }
+        { "expr": "increase(waggle_auth_failures_total[5m])", "legendFormat": "Auth failures (5m)", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" } }
       ],
       "title": "Auth Failures (5m)",
       "type": "stat"
@@ -111,7 +111,7 @@
       "id": 6,
       "options": { "reduceOptions": { "calcs": ["sum"] } },
       "targets": [
-        { "expr": "increase(graph_memory_rate_limit_rejections_total[5m])", "legendFormat": "Rate limit (5m)", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" } }
+        { "expr": "increase(waggle_rate_limit_rejections_total[5m])", "legendFormat": "Rate limit (5m)", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" } }
       ],
       "title": "Rate Limit Rejections (5m)",
       "type": "stat"
@@ -131,17 +131,17 @@
       "options": { "tooltip": { "mode": "multi" } },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(graph_memory_tool_latency_seconds_bucket[2m]))",
+          "expr": "histogram_quantile(0.50, rate(waggle_tool_latency_seconds_bucket[2m]))",
           "legendFormat": "p50 {{tool}}",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
         },
         {
-          "expr": "histogram_quantile(0.95, rate(graph_memory_tool_latency_seconds_bucket[2m]))",
+          "expr": "histogram_quantile(0.95, rate(waggle_tool_latency_seconds_bucket[2m]))",
           "legendFormat": "p95 {{tool}}",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
         },
         {
-          "expr": "histogram_quantile(0.99, rate(graph_memory_tool_latency_seconds_bucket[2m]))",
+          "expr": "histogram_quantile(0.99, rate(waggle_tool_latency_seconds_bucket[2m]))",
           "legendFormat": "p99 {{tool}}",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
         }
@@ -156,7 +156,7 @@
       "id": 11,
       "targets": [
         {
-          "expr": "graph_memory_tool_latency_seconds_sum / graph_memory_tool_latency_seconds_count",
+          "expr": "waggle_tool_latency_seconds_sum / waggle_tool_latency_seconds_count",
           "legendFormat": "avg {{tool}}",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
         }
@@ -178,12 +178,12 @@
       "id": 20,
       "targets": [
         {
-          "expr": "rate(graph_memory_tool_requests_total{status=\"success\"}[1m])",
+          "expr": "rate(waggle_tool_requests_total{status=\"success\"}[1m])",
           "legendFormat": "success {{tool}}",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
         },
         {
-          "expr": "rate(graph_memory_tool_requests_total{status=\"error\"}[1m])",
+          "expr": "rate(waggle_tool_requests_total{status=\"error\"}[1m])",
           "legendFormat": "error {{tool}}",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
         }
@@ -198,12 +198,12 @@
       "id": 21,
       "targets": [
         {
-          "expr": "increase(graph_memory_dedup_hits_total[5m])",
+          "expr": "increase(waggle_dedup_hits_total[5m])",
           "legendFormat": "dedup {{dedup_reason}}",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
         },
         {
-          "expr": "increase(graph_memory_conflicts_total[5m])",
+          "expr": "increase(waggle_conflicts_total[5m])",
           "legendFormat": "conflicts",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
         }
@@ -214,7 +214,7 @@
   ],
   "refresh": "30s",
   "schemaVersion": 39,
-  "tags": ["graph-memory", "mcp"],
+  "tags": ["waggle", "mcp"],
   "templating": {
     "list": [
       {
@@ -232,7 +232,7 @@
   "time": { "from": "now-1h", "to": "now" },
   "timepicker": {},
   "timezone": "browser",
-  "title": "graph-memory-mcp",
-  "uid": "graph-memory-mcp-v1",
+  "title": "waggle-mcp",
+  "uid": "waggle-mcp-v1",
   "version": 1
 }

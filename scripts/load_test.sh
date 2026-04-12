@@ -6,12 +6,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-HOST="${GRAPH_MEMORY_HOST:-http://localhost:8080}"
-API_KEY="${GRAPH_MEMORY_API_KEY:-}"
+HOST="${WAGGLE_HOST:-http://localhost:8080}"
+API_KEY="${WAGGLE_API_KEY:-}"
 PRESET="${1:-medium}"
 
 if [[ -z "$API_KEY" ]]; then
-  echo "ERROR: set GRAPH_MEMORY_API_KEY before running this script."
+  echo "ERROR: set WAGGLE_API_KEY before running this script."
   exit 1
 fi
 

@@ -1,7 +1,7 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: graph-memory
+  name: waggle
   annotations:
     # cert-manager will provision and renew the TLS certificate automatically.
     # Switch to letsencrypt-prod once you have confirmed the staging cert works.
@@ -25,17 +25,17 @@ spec:
   tls:
     - hosts:
         # Replace with your real hostname before applying
-        - graph-memory.example.com
+        - waggle.example.com
       # cert-manager will create this Secret automatically
-      secretName: graph-memory-tls
+      secretName: waggle-tls
   rules:
-    - host: graph-memory.example.com
+    - host: waggle.example.com
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: graph-memory
+                name: waggle
                 port:
                   name: http

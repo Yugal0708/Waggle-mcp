@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" alt="graph-memory-mcp" width="720"/>
+  <img src="assets/banner.png" alt="waggle-mcp" width="720"/>
 </p>
 
 <p align="center">
@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/graph-memory-mcp"><img src="https://img.shields.io/pypi/v/graph-memory-mcp?color=39d5cf&label=pypi" alt="PyPI"/></a>
+  <a href="https://pypi.org/project/waggle-mcp"><img src="https://img.shields.io/pypi/v/waggle-mcp?color=39d5cf&label=pypi" alt="PyPI"/></a>
   <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+"/>
   <img src="https://img.shields.io/badge/MCP-compatible-brightgreen" alt="MCP"/>
   <img src="https://img.shields.io/badge/embeddings-local%2C%20no%20API%20key-orange" alt="Local embeddings"/>
@@ -17,12 +17,12 @@
 
 ---
 
-## Why graph-memory-mcp?
+## Why waggle-mcp?
 
 Most LLMs forget everything when the conversation ends.  
-`graph-memory-mcp` fixes that by giving your AI a **persistent knowledge graph** it can read and write through any MCP-compatible client.
+`waggle-mcp` fixes that by giving your AI a **persistent knowledge graph** it can read and write through any MCP-compatible client.
 
-| Without graph-memory-mcp | With graph-memory-mcp |
+| Without waggle-mcp | With waggle-mcp |
 |--------------------------|----------------------|
 | "What did we decide about the DB schema?" → ❌ no idea | ✅ Recalls the decision node, when it was made, and what it contradicts |
 | Context stuffed into a 200k-token prompt | Compact subgraph — only relevant nodes retrieved |
@@ -34,7 +34,7 @@ Most LLMs forget everything when the conversation ends.
 ## Demo
 
 <p align="center">
-  <img src="assets/demo.svg" alt="graph-memory-mcp init demo" width="720"/>
+  <img src="assets/demo.svg" alt="waggle-mcp init demo" width="720"/>
 </p>
 
 ---
@@ -42,8 +42,8 @@ Most LLMs forget everything when the conversation ends.
 ## Quick start — 30 seconds
 
 ```bash
-pip install graph-memory-mcp
-graph-memory-mcp init
+pip install waggle-mcp
+waggle-mcp init
 ```
 
 The `init` wizard detects your MCP client, writes its config file, and creates
@@ -146,7 +146,7 @@ No instructions needed. No schema to define. Just observe.
 Most memory systems answer "what do you know about X?" — but can't answer
 *when* you learned it or how knowledge changed over time.
 
-`graph-memory-mcp` understands temporal natural language natively:
+`waggle-mcp` understands temporal natural language natively:
 
 | Query | What happens |
 |-------|-------------|
@@ -169,7 +169,7 @@ complexity, but enough to reconstruct a meaningful timeline of decisions.
 | `fact` | "The API uses JWT tokens" |
 | `preference` | "User prefers dark mode" |
 | `decision` | "Chose PostgreSQL over MySQL" |
-| `entity` | "Project: graph-memory-mcp" |
+| `entity` | "Project: waggle-mcp" |
 | `concept` | "Rate limiting" |
 | `question` | "Should we add GraphQL?" |
 | `note` | "TODO: add integration tests" |
@@ -211,16 +211,16 @@ complexity, but enough to reconstruct a meaningful timeline of decisions.
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-graph-memory-mcp init        # ← writes your client config automatically
+waggle-mcp init        # ← writes your client config automatically
 ```
 
 Three key variables for local mode:
 
 | Variable | What it does |
 |----------|-------------|
-| `GRAPH_MEMORY_BACKEND=sqlite` | Local file DB, zero setup |
-| `GRAPH_MEMORY_TRANSPORT=stdio` | Connects to desktop MCP clients |
-| `GRAPH_MEMORY_DB_PATH` | Where the graph is stored (default: `memory.db`) |
+| `WAGGLE_BACKEND=sqlite` | Local file DB, zero setup |
+| `WAGGLE_TRANSPORT=stdio` | Connects to desktop MCP clients |
+| `WAGGLE_DB_PATH` | Where the graph is stored (default: `memory.db`) |
 
 ### Production (Neo4j backend)
 
@@ -231,28 +231,28 @@ pip install -e ".[dev,neo4j]"
 Then run the server:
 
 ```bash
-GRAPH_MEMORY_TRANSPORT=http \
-GRAPH_MEMORY_BACKEND=neo4j \
-GRAPH_MEMORY_DEFAULT_TENANT_ID=workspace-default \
-GRAPH_MEMORY_NEO4J_URI=bolt://localhost:7687 \
-GRAPH_MEMORY_NEO4J_USERNAME=neo4j \
-GRAPH_MEMORY_NEO4J_PASSWORD=change-me \
-graph-memory-mcp
+WAGGLE_TRANSPORT=http \
+WAGGLE_BACKEND=neo4j \
+WAGGLE_DEFAULT_TENANT_ID=workspace-default \
+WAGGLE_NEO4J_URI=bolt://localhost:7687 \
+WAGGLE_NEO4J_USERNAME=neo4j \
+WAGGLE_NEO4J_PASSWORD=change-me \
+waggle-mcp
 ```
 
 ### Docker
 
 ```bash
-docker build -t graph-memory-mcp:latest .
+docker build -t waggle-mcp:latest .
 
 docker run --rm -p 8080:8080 \
-  -e GRAPH_MEMORY_TRANSPORT=http \
-  -e GRAPH_MEMORY_BACKEND=neo4j \
-  -e GRAPH_MEMORY_DEFAULT_TENANT_ID=workspace-default \
-  -e GRAPH_MEMORY_NEO4J_URI=bolt://host.docker.internal:7687 \
-  -e GRAPH_MEMORY_NEO4J_USERNAME=neo4j \
-  -e GRAPH_MEMORY_NEO4J_PASSWORD=change-me \
-  graph-memory-mcp:latest
+  -e WAGGLE_TRANSPORT=http \
+  -e WAGGLE_BACKEND=neo4j \
+  -e WAGGLE_DEFAULT_TENANT_ID=workspace-default \
+  -e WAGGLE_NEO4J_URI=bolt://host.docker.internal:7687 \
+  -e WAGGLE_NEO4J_USERNAME=neo4j \
+  -e WAGGLE_NEO4J_PASSWORD=change-me \
+  waggle-mcp:latest
 ```
 
 ---
@@ -266,16 +266,16 @@ If you prefer to edit config files directly, or `init` doesn't cover your client
 ```json
 {
   "mcpServers": {
-    "graph-memory": {
+    "waggle": {
       "command": "/path/to/.venv/bin/python",
-      "args": ["-m", "graph_memory.server"],
+      "args": ["-m", "waggle.server"],
       "env": {
-        "PYTHONPATH": "/path/to/graph-memory-mcp/src",
-        "GRAPH_MEMORY_TRANSPORT": "stdio",
-        "GRAPH_MEMORY_BACKEND": "sqlite",
-        "GRAPH_MEMORY_DB_PATH": "~/.graph-memory/memory.db",
-        "GRAPH_MEMORY_DEFAULT_TENANT_ID": "local-default",
-        "GRAPH_MEMORY_MODEL": "all-MiniLM-L6-v2"
+        "PYTHONPATH": "/path/to/waggle-mcp/src",
+        "WAGGLE_TRANSPORT": "stdio",
+        "WAGGLE_BACKEND": "sqlite",
+        "WAGGLE_DB_PATH": "~/.waggle/memory.db",
+        "WAGGLE_DEFAULT_TENANT_ID": "local-default",
+        "WAGGLE_MODEL": "all-MiniLM-L6-v2"
       }
     }
   }
@@ -285,17 +285,17 @@ If you prefer to edit config files directly, or `init` doesn't cover your client
 ### Codex — `codex_config.toml`
 
 ```toml
-[mcp_servers.graph-memory]
+[mcp_servers.waggle]
 command = "/path/to/.venv/bin/python"
-args    = ["-m", "graph_memory.server"]
-cwd     = "/path/to/graph-memory-mcp"
+args    = ["-m", "waggle.server"]
+cwd     = "/path/to/waggle-mcp"
 env     = {
-  PYTHONPATH                     = "/path/to/graph-memory-mcp/src",
-  GRAPH_MEMORY_TRANSPORT         = "stdio",
-  GRAPH_MEMORY_BACKEND           = "sqlite",
-  GRAPH_MEMORY_DB_PATH           = "~/.graph-memory/memory.db",
-  GRAPH_MEMORY_DEFAULT_TENANT_ID = "local-default",
-  GRAPH_MEMORY_MODEL             = "all-MiniLM-L6-v2"
+  PYTHONPATH                     = "/path/to/waggle-mcp/src",
+  WAGGLE_TRANSPORT         = "stdio",
+  WAGGLE_BACKEND           = "sqlite",
+  WAGGLE_DB_PATH           = "~/.waggle/memory.db",
+  WAGGLE_DEFAULT_TENANT_ID = "local-default",
+  WAGGLE_MODEL             = "all-MiniLM-L6-v2"
 }
 ```
 
@@ -312,39 +312,39 @@ A pre-filled example is in [`codex_config.example.toml`](./codex_config.example.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GRAPH_MEMORY_BACKEND` | `sqlite` | `sqlite` or `neo4j` |
-| `GRAPH_MEMORY_TRANSPORT` | `stdio` | `stdio` or `http` |
-| `GRAPH_MEMORY_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model (local inference) |
-| `GRAPH_MEMORY_DEFAULT_TENANT_ID` | `local-default` | default tenant |
-| `GRAPH_MEMORY_EXPORT_DIR` | — | optional export directory |
+| `WAGGLE_BACKEND` | `sqlite` | `sqlite` or `neo4j` |
+| `WAGGLE_TRANSPORT` | `stdio` | `stdio` or `http` |
+| `WAGGLE_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model (local inference) |
+| `WAGGLE_DEFAULT_TENANT_ID` | `local-default` | default tenant |
+| `WAGGLE_EXPORT_DIR` | — | optional export directory |
 
 ### SQLite
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GRAPH_MEMORY_DB_PATH` | `memory.db` | path to the SQLite file |
+| `WAGGLE_DB_PATH` | `memory.db` | path to the SQLite file |
 
 ### HTTP service
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GRAPH_MEMORY_HTTP_HOST` | `0.0.0.0` | bind host |
-| `GRAPH_MEMORY_HTTP_PORT` | `8080` | bind port |
-| `GRAPH_MEMORY_LOG_LEVEL` | `INFO` | log level |
-| `GRAPH_MEMORY_RATE_LIMIT_RPM` | `120` | global rate limit (req/min) |
-| `GRAPH_MEMORY_WRITE_RATE_LIMIT_RPM` | `60` | write-tool rate limit |
-| `GRAPH_MEMORY_MAX_CONCURRENT_REQUESTS` | `8` | concurrency cap |
-| `GRAPH_MEMORY_MAX_PAYLOAD_BYTES` | `1048576` | max request size |
-| `GRAPH_MEMORY_REQUEST_TIMEOUT_SECONDS` | `30` | per-request timeout |
+| `WAGGLE_HTTP_HOST` | `0.0.0.0` | bind host |
+| `WAGGLE_HTTP_PORT` | `8080` | bind port |
+| `WAGGLE_LOG_LEVEL` | `INFO` | log level |
+| `WAGGLE_RATE_LIMIT_RPM` | `120` | global rate limit (req/min) |
+| `WAGGLE_WRITE_RATE_LIMIT_RPM` | `60` | write-tool rate limit |
+| `WAGGLE_MAX_CONCURRENT_REQUESTS` | `8` | concurrency cap |
+| `WAGGLE_MAX_PAYLOAD_BYTES` | `1048576` | max request size |
+| `WAGGLE_REQUEST_TIMEOUT_SECONDS` | `30` | per-request timeout |
 
 ### Neo4j
 
 | Variable | Description |
 |----------|-------------|
-| `GRAPH_MEMORY_NEO4J_URI` | Bolt URI, e.g. `bolt://localhost:7687` |
-| `GRAPH_MEMORY_NEO4J_USERNAME` | Neo4j username |
-| `GRAPH_MEMORY_NEO4J_PASSWORD` | Neo4j password |
-| `GRAPH_MEMORY_NEO4J_DATABASE` | Neo4j database name |
+| `WAGGLE_NEO4J_URI` | Bolt URI, e.g. `bolt://localhost:7687` |
+| `WAGGLE_NEO4J_USERNAME` | Neo4j username |
+| `WAGGLE_NEO4J_PASSWORD` | Neo4j password |
+| `WAGGLE_NEO4J_DATABASE` | Neo4j database name |
 
 </details>
 
@@ -354,21 +354,21 @@ A pre-filled example is in [`codex_config.example.toml`](./codex_config.example.
 
 ```bash
 # Create a tenant
-graph-memory-mcp create-tenant --tenant-id workspace-a --name "Workspace A"
+waggle-mcp create-tenant --tenant-id workspace-a --name "Workspace A"
 
 # Issue an API key (raw key returned once — store it securely)
-graph-memory-mcp create-api-key --tenant-id workspace-a --name "ci-agent"
+waggle-mcp create-api-key --tenant-id workspace-a --name "ci-agent"
 
 # List keys for a tenant
-graph-memory-mcp list-api-keys --tenant-id workspace-a
+waggle-mcp list-api-keys --tenant-id workspace-a
 
 # Revoke a key
-graph-memory-mcp revoke-api-key --api-key-id <id>
+waggle-mcp revoke-api-key --api-key-id <id>
 
 # Migrate SQLite data → Neo4j
-GRAPH_MEMORY_BACKEND=neo4j GRAPH_MEMORY_NEO4J_URI=bolt://localhost:7687 \
-GRAPH_MEMORY_NEO4J_USERNAME=neo4j GRAPH_MEMORY_NEO4J_PASSWORD=change-me \
-  graph-memory-mcp migrate-sqlite --db-path ./memory.db --tenant-id workspace-a
+WAGGLE_BACKEND=neo4j WAGGLE_NEO4J_URI=bolt://localhost:7687 \
+WAGGLE_NEO4J_USERNAME=neo4j WAGGLE_NEO4J_PASSWORD=change-me \
+  waggle-mcp migrate-sqlite --db-path ./memory.db --tenant-id workspace-a
 ```
 
 ---
@@ -407,11 +407,11 @@ backup/import, stdio MCP, HTTP auth/health/metrics, payload limits.
 
 ```bash
 # End-to-end backup/restore drill
-GRAPH_MEMORY_HOST=http://localhost:8080 GRAPH_MEMORY_API_KEY=<key> \
+WAGGLE_HOST=http://localhost:8080 WAGGLE_API_KEY=<key> \
   ./scripts/backup_restore_drill.sh
 
 # Load test (p50/p95/p99 latency report)
-GRAPH_MEMORY_API_KEY=<key> ./scripts/load_test.sh --medium
+WAGGLE_API_KEY=<key> ./scripts/load_test.sh --medium
 ```
 
 ---
@@ -419,7 +419,7 @@ GRAPH_MEMORY_API_KEY=<key> ./scripts/load_test.sh --medium
 ## Architecture
 
 ```
-graph-memory-mcp
+waggle-mcp
 ├── Core domain    graph CRUD · dedup · local embeddings · conflict detection · export/import
 ├── Transport      stdio MCP (Codex/Desktop) · streamable HTTP MCP (Kubernetes)
 └── Platform       config · auth · tenant isolation · rate limiting · logging · metrics
@@ -427,14 +427,14 @@ graph-memory-mcp
 
 **Backend:**
 - Local/dev → SQLite (zero config, instant start)
-- Production → Neo4j (`GRAPH_MEMORY_TRANSPORT=http` requires `GRAPH_MEMORY_BACKEND=neo4j`)
+- Production → Neo4j (`WAGGLE_TRANSPORT=http` requires `WAGGLE_BACKEND=neo4j`)
 
 ---
 
 ## Project layout
 
 ```
-graph-memory-mcp/
+waggle-mcp/
 ├── assets/                   ← banner + demo SVG
 ├── deploy/
 │   ├── kubernetes/           ← full K8s manifests + guide
@@ -443,7 +443,7 @@ graph-memory-mcp/
 ├── scripts/
 │   ├── load_test.py / .sh
 │   └── backup_restore_drill.py / .sh
-├── src/graph_memory/         ← server, graph, neo4j_graph, auth, config …
+├── src/waggle/         ← server, graph, neo4j_graph, auth, config …
 ├── tests/
 ├── Dockerfile
 ├── pyproject.toml

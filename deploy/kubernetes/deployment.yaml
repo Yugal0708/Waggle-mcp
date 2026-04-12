@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: graph-memory
+  name: waggle
   annotations:
     # Prometheus pod auto-discovery
     prometheus.io/scrape: "true"
@@ -20,11 +20,11 @@ spec:
       maxUnavailable: 0
   selector:
     matchLabels:
-      app: graph-memory
+      app: waggle
   template:
     metadata:
       labels:
-        app: graph-memory
+        app: waggle
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/path: "/metrics"
@@ -41,8 +41,8 @@ spec:
       # Ensure the pod is evicted from unhealthy nodes gracefully.
       terminationGracePeriodSeconds: 30
       containers:
-        - name: graph-memory
-          image: graph-memory-mcp:latest
+        - name: waggle
+          image: waggle-mcp:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -50,9 +50,9 @@ spec:
               protocol: TCP
           envFrom:
             - configMapRef:
-                name: graph-memory-config
+                name: waggle-config
             - secretRef:
-                name: graph-memory-secret
+                name: waggle-secret
           # Hardened container security context
           securityContext:
             allowPrivilegeEscalation: false

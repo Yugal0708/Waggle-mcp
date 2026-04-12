@@ -26,19 +26,19 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
 
-from graph_memory.config import AppConfig
-from graph_memory.embeddings import EmbeddingModel
-from graph_memory.errors import (
+from waggle.config import AppConfig
+from waggle.embeddings import EmbeddingModel
+from waggle.errors import (
     AuthenticationError,
-    GraphMemoryError,
+    WaggleError,
     PayloadTooLargeError,
     ServiceUnavailableError,
     ValidationFailure,
 )
-from graph_memory.graph import MemoryGraph
-from graph_memory.logging_utils import configure_logging
-from graph_memory.metrics import MetricsRegistry
-from graph_memory.models import (
+from waggle.graph import MemoryGraph
+from waggle.logging_utils import configure_logging
+from waggle.metrics import MetricsRegistry
+from waggle.models import (
     GraphDiffResult,
     GraphStats,
     Node,
@@ -49,9 +49,9 @@ from graph_memory.models import (
     SubgraphResult,
     TopicResult,
 )
-from graph_memory.rate_limit import RateLimiter
-from graph_memory.runtime_context import runtime_context
-from graph_memory.serializer import (
+from waggle.rate_limit import RateLimiter
+from waggle.runtime_context import runtime_context
+from waggle.serializer import (
     serialize_graph_diff,
     serialize_observation_result,
     serialize_prime_context,
@@ -74,7 +74,7 @@ def _build_backend(config: AppConfig) -> Any:
             tenant_id=config.default_tenant_id,
             export_dir=config.export_dir,
         )
-    from graph_memory.neo4j_graph import Neo4jMemoryGraph
+    from waggle.neo4j_graph import Neo4jMemoryGraph
 
     return Neo4jMemoryGraph(
         uri=config.neo4j_uri,
@@ -87,7 +87,7 @@ def _build_backend(config: AppConfig) -> Any:
     )
 
 
-class GraphMemoryServer:
+class WaggleServer:
     """MCP server wrapper with tenant-aware graph resolution."""
 
     def __init__(
@@ -101,7 +101,7 @@ class GraphMemoryServer:
         self.metrics = metrics or MetricsRegistry()
         self._static_graph = graph
         self._root_graph = graph or _build_backend(self.config)
-        self.server = Server("graph-memory")
+        self.server = Server("waggle")
         self._register_handlers()
 
     @property
@@ -322,7 +322,7 @@ class GraphMemoryServer:
         started = time.perf_counter()
         graph.ensure_tenant(graph.tenant_id)
         graph.embedding_model.embed("startup validation")
-        self.metrics.observe("graph_memory_startup_validation_seconds", time.perf_counter() - started, backend=self.config.backend)
+        self.metrics.observe("waggle_startup_validation_seconds", time.perf_counter() - started, backend=self.config.backend)
 
     def build_resources(self) -> types.ListResourcesResult:
         return types.ListResourcesResult(
@@ -342,7 +342,7 @@ class GraphMemoryServer:
 
     def initialization_options(self) -> InitializationOptions:
         return InitializationOptions(
-            server_name="graph-memory",
+            server_name="waggle",
             server_version="0.2.0",
             capabilities=self.server.get_capabilities(notification_options=NotificationOptions(), experimental_capabilities={}),
         )
@@ -389,13 +389,13 @@ class GraphMemoryServer:
                         text += f" Detected {len(store_result.conflicts)} potential conflict(s)."
                     if not store_result.created:
                         self.metrics.increment(
-                            "graph_memory_dedup_hits_total",
+                            "waggle_dedup_hits_total",
                             tenant_id=getattr(graph, "tenant_id", self.config.default_tenant_id),
                             dedup_reason=store_result.dedup_reason or "unknown",
                         )
                     if store_result.conflicts:
                         self.metrics.increment(
-                            "graph_memory_conflicts_total",
+                            "waggle_conflicts_total",
                             value=len(store_result.conflicts),
                             tenant_id=getattr(graph, "tenant_id", self.config.default_tenant_id),
                         )
@@ -525,26 +525,26 @@ class GraphMemoryServer:
 
                 elapsed = time.perf_counter() - started
                 self.metrics.increment(
-                    "graph_memory_tool_requests_total",
+                    "waggle_tool_requests_total",
                     tool=name,
                     status="success",
                     tenant_id=getattr(graph, "tenant_id", self.config.default_tenant_id),
                 )
-                self.metrics.observe("graph_memory_tool_latency_seconds", elapsed, tool=name)
+                self.metrics.observe("waggle_tool_latency_seconds", elapsed, tool=name)
                 self._record_graph_size(graph)
                 LOGGER.info("tool_call_completed")
                 return result
             except Exception as exc:
                 elapsed = time.perf_counter() - started
                 self.metrics.increment(
-                    "graph_memory_tool_requests_total",
+                    "waggle_tool_requests_total",
                     tool=name,
                     status="error",
                     tenant_id=getattr(graph, "tenant_id", self.config.default_tenant_id),
                 )
-                self.metrics.observe("graph_memory_tool_latency_seconds", elapsed, tool=name)
+                self.metrics.observe("waggle_tool_latency_seconds", elapsed, tool=name)
                 if isinstance(exc, AuthenticationError):
-                    self.metrics.increment("graph_memory_auth_failures_total", tenant_id=getattr(graph, "tenant_id", self.config.default_tenant_id))
+                    self.metrics.increment("waggle_auth_failures_total", tenant_id=getattr(graph, "tenant_id", self.config.default_tenant_id))
                 LOGGER.exception("tool_call_failed")
                 return self._error_result(exc)
 
@@ -552,7 +552,7 @@ class GraphMemoryServer:
         return types.CallToolResult(content=[types.TextContent(type="text", text=text)], structuredContent=structured)
 
     def _error_result(self, exc: Exception) -> types.CallToolResult:
-        if isinstance(exc, GraphMemoryError):
+        if isinstance(exc, WaggleError):
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text=f"Error [{exc.code}]: {exc}")],
                 structuredContent={"error": str(exc), "error_type": type(exc).__name__, "error_code": exc.code, "status_code": exc.status_code},
@@ -699,12 +699,12 @@ class GraphMemoryServer:
     def _record_graph_size(self, graph: Any) -> None:
         stats = graph.get_stats()
         tenant_id = getattr(graph, "tenant_id", self.config.default_tenant_id)
-        self.metrics.set_gauge("graph_memory_graph_nodes", stats.total_nodes, tenant_id=tenant_id)
-        self.metrics.set_gauge("graph_memory_graph_edges", stats.total_edges, tenant_id=tenant_id)
+        self.metrics.set_gauge("waggle_graph_nodes", stats.total_nodes, tenant_id=tenant_id)
+        self.metrics.set_gauge("waggle_graph_edges", stats.total_edges, tenant_id=tenant_id)
 
 
 class MCPHttpApp:
-    def __init__(self, app_server: GraphMemoryServer, config: AppConfig) -> None:
+    def __init__(self, app_server: WaggleServer, config: AppConfig) -> None:
         self.app_server = app_server
         self.config = config
         self.metrics = app_server.metrics
@@ -732,14 +732,14 @@ class MCPHttpApp:
                 )
                 self.app_server.validate_startup()
                 self.ready = True
-                self.metrics.set_gauge("graph_memory_ready", 1)
+                self.metrics.set_gauge("waggle_ready", 1)
                 app.state.http_service = self
                 try:
                     yield
                 finally:
                     self.draining = True
                     self.ready = False
-                    self.metrics.set_gauge("graph_memory_ready", 0)
+                    self.metrics.set_gauge("waggle_ready", 0)
                     tg.cancel_scope.cancel()
 
     async def mcp_asgi(self, scope: Any, receive: Any, send: Any) -> None:
@@ -790,23 +790,23 @@ class MCPHttpApp:
                     with anyio.fail_after(self.config.request_timeout_seconds):
                         assert self.transport is not None
                         await self.transport.handle_request(scope, receive_callable, send_wrapper)
-        except GraphMemoryError as exc:
+        except WaggleError as exc:
             LOGGER.warning("http_request_failed", extra={"error_code": exc.code, "status_code": exc.status_code})
             if isinstance(exc, AuthenticationError):
-                self.metrics.increment("graph_memory_auth_failures_total")
+                self.metrics.increment("waggle_auth_failures_total")
             if exc.code == "rate_limited":
-                self.metrics.increment("graph_memory_rate_limit_rejections_total")
+                self.metrics.increment("waggle_rate_limit_rejections_total")
             await JSONResponse({"error": exc.code, "message": str(exc)}, status_code=exc.status_code)(scope, receive, send)
             status_holder["status"] = exc.status_code
         finally:
             elapsed = time.perf_counter() - started
             self.metrics.increment(
-                "graph_memory_http_requests_total",
+                "waggle_http_requests_total",
                 path="/mcp",
                 method=method,
                 status=str(status_holder["status"]),
             )
-            self.metrics.observe("graph_memory_http_request_latency_seconds", elapsed, path="/mcp", method=method)
+            self.metrics.observe("waggle_http_request_latency_seconds", elapsed, path="/mcp", method=method)
 
     @staticmethod
     def _extract_tool_name(body: bytes) -> str:
@@ -835,7 +835,7 @@ class MCPHttpApp:
         return receive
 
 
-def create_http_application(app_server: GraphMemoryServer, config: AppConfig) -> Starlette:
+def create_http_application(app_server: WaggleServer, config: AppConfig) -> Starlette:
     service = MCPHttpApp(app_server, config)
 
     async def live(_: Request) -> Response:
@@ -862,7 +862,7 @@ def create_http_application(app_server: GraphMemoryServer, config: AppConfig) ->
     return app
 
 
-_APP: GraphMemoryServer | None = None
+_APP: WaggleServer | None = None
 
 
 def _default_graph(config: AppConfig | None = None) -> Any:
@@ -872,10 +872,10 @@ def _default_graph(config: AppConfig | None = None) -> Any:
         raise RuntimeError(str(exc)) from exc
 
 
-def get_app(config: AppConfig | None = None) -> GraphMemoryServer:
+def get_app(config: AppConfig | None = None) -> WaggleServer:
     global _APP
     if _APP is None:
-        _APP = GraphMemoryServer(config=config or AppConfig.from_env())
+        _APP = WaggleServer(config=config or AppConfig.from_env())
     return _APP
 
 
@@ -892,7 +892,7 @@ def run_http(config: AppConfig) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="graph-memory-mcp")
+    parser = argparse.ArgumentParser(prog="waggle-mcp")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("serve")
 
@@ -914,7 +914,7 @@ def _build_parser() -> argparse.ArgumentParser:
     migrate_sqlite.add_argument("--db-path", required=True)
     migrate_sqlite.add_argument("--tenant-id", required=True)
 
-    subparsers.add_parser("init", help="Interactive setup wizard — configure an MCP client to use graph-memory-mcp.")
+    subparsers.add_parser("init", help="Interactive setup wizard — configure an MCP client to use waggle-mcp.")
     return parser
 
 
@@ -948,7 +948,7 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
         return 0
     if args.command == "migrate-sqlite":
         if config.backend != "neo4j":
-            raise ValidationFailure("migrate-sqlite requires GRAPH_MEMORY_BACKEND=neo4j for the target environment.")
+            raise ValidationFailure("migrate-sqlite requires WAGGLE_BACKEND=neo4j for the target environment.")
         source = MemoryGraph(args.db_path, EmbeddingModel(config.model_name), tenant_id=args.tenant_id, export_dir=config.export_dir)
         target = backend.for_tenant(args.tenant_id)
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as handle:
@@ -1024,10 +1024,10 @@ def _python_exe() -> str:
 
 def _package_root() -> str:
     """Return a best-effort src/ directory for PYTHONPATH."""
-    # Walk up from this file looking for src/graph_memory
+    # Walk up from this file looking for src/waggle
     here = Path(__file__).resolve().parent
     candidate = here.parent  # expected: .../src
-    if (candidate / "graph_memory").is_dir():
+    if (candidate / "waggle").is_dir():
         return str(candidate)
     return str(here.parent)
 
@@ -1051,16 +1051,16 @@ def _write_claude_desktop(db_path: str, python_exe: str, src_root: str) -> Path:
             pass
 
     existing.setdefault("mcpServers", {})
-    existing["mcpServers"]["graph-memory"] = {
+    existing["mcpServers"]["waggle"] = {
         "command": python_exe,
-        "args": ["-m", "graph_memory.server"],
+        "args": ["-m", "waggle.server"],
         "env": {
             "PYTHONPATH": src_root,
-            "GRAPH_MEMORY_TRANSPORT": "stdio",
-            "GRAPH_MEMORY_BACKEND": "sqlite",
-            "GRAPH_MEMORY_DB_PATH": db_path,
-            "GRAPH_MEMORY_DEFAULT_TENANT_ID": "local-default",
-            "GRAPH_MEMORY_MODEL": "all-MiniLM-L6-v2",
+            "WAGGLE_TRANSPORT": "stdio",
+            "WAGGLE_BACKEND": "sqlite",
+            "WAGGLE_DB_PATH": db_path,
+            "WAGGLE_DEFAULT_TENANT_ID": "local-default",
+            "WAGGLE_MODEL": "all-MiniLM-L6-v2",
         },
     }
     config_file.write_text(json.dumps(existing, indent=2))
@@ -1081,16 +1081,16 @@ def _write_cursor(db_path: str, python_exe: str, src_root: str) -> Path:
             pass
 
     existing.setdefault("mcpServers", {})
-    existing["mcpServers"]["graph-memory"] = {
+    existing["mcpServers"]["waggle"] = {
         "command": python_exe,
-        "args": ["-m", "graph_memory.server"],
+        "args": ["-m", "waggle.server"],
         "env": {
             "PYTHONPATH": src_root,
-            "GRAPH_MEMORY_TRANSPORT": "stdio",
-            "GRAPH_MEMORY_BACKEND": "sqlite",
-            "GRAPH_MEMORY_DB_PATH": db_path,
-            "GRAPH_MEMORY_DEFAULT_TENANT_ID": "local-default",
-            "GRAPH_MEMORY_MODEL": "all-MiniLM-L6-v2",
+            "WAGGLE_TRANSPORT": "stdio",
+            "WAGGLE_BACKEND": "sqlite",
+            "WAGGLE_DB_PATH": db_path,
+            "WAGGLE_DEFAULT_TENANT_ID": "local-default",
+            "WAGGLE_MODEL": "all-MiniLM-L6-v2",
         },
     }
     config_file.write_text(json.dumps(existing, indent=2))
@@ -1101,17 +1101,17 @@ def _write_codex(db_path: str, python_exe: str, src_root: str) -> Path:
     """Write ~/codex_mcp.toml (printable TOML snippet — Codex uses a TOML file)."""
     config_file = Path.home() / "codex_mcp.toml"
     toml_block = (
-        '[mcp_servers.graph-memory]\n'
+        '[mcp_servers.waggle]\n'
         f'command = "{python_exe}"\n'
-        'args = ["-m", "graph_memory.server"]\n'
+        'args = ["-m", "waggle.server"]\n'
         f'cwd = "{Path(src_root).parent}"\n'
         'env = {\n'
         f'  PYTHONPATH = "{src_root}",\n'
-        '  GRAPH_MEMORY_TRANSPORT = "stdio",\n'
-        '  GRAPH_MEMORY_BACKEND = "sqlite",\n'
-        f'  GRAPH_MEMORY_DB_PATH = "{db_path}",\n'
-        '  GRAPH_MEMORY_DEFAULT_TENANT_ID = "local-default",\n'
-        '  GRAPH_MEMORY_MODEL = "all-MiniLM-L6-v2"\n'
+        '  WAGGLE_TRANSPORT = "stdio",\n'
+        '  WAGGLE_BACKEND = "sqlite",\n'
+        f'  WAGGLE_DB_PATH = "{db_path}",\n'
+        '  WAGGLE_DEFAULT_TENANT_ID = "local-default",\n'
+        '  WAGGLE_MODEL = "all-MiniLM-L6-v2"\n'
         '}\n'
     )
     config_file.write_text(toml_block)
@@ -1119,18 +1119,18 @@ def _write_codex(db_path: str, python_exe: str, src_root: str) -> Path:
 
 
 def _write_other(db_path: str, python_exe: str, src_root: str) -> Path:
-    """Write a generic JSON snippet to ~/graph-memory-mcp-config.json."""
-    config_file = Path.home() / "graph-memory-mcp-config.json"
+    """Write a generic JSON snippet to ~/waggle-mcp-config.json."""
+    config_file = Path.home() / "waggle-mcp-config.json"
     snippet = {
         "command": python_exe,
-        "args": ["-m", "graph_memory.server"],
+        "args": ["-m", "waggle.server"],
         "env": {
             "PYTHONPATH": src_root,
-            "GRAPH_MEMORY_TRANSPORT": "stdio",
-            "GRAPH_MEMORY_BACKEND": "sqlite",
-            "GRAPH_MEMORY_DB_PATH": db_path,
-            "GRAPH_MEMORY_DEFAULT_TENANT_ID": "local-default",
-            "GRAPH_MEMORY_MODEL": "all-MiniLM-L6-v2",
+            "WAGGLE_TRANSPORT": "stdio",
+            "WAGGLE_BACKEND": "sqlite",
+            "WAGGLE_DB_PATH": db_path,
+            "WAGGLE_DEFAULT_TENANT_ID": "local-default",
+            "WAGGLE_MODEL": "all-MiniLM-L6-v2",
         },
     }
     config_file.write_text(json.dumps(snippet, indent=2))
@@ -1153,15 +1153,15 @@ _RESTART_HINTS = {
 
 
 def _run_init() -> int:
-    """Interactive setup wizard for graph-memory-mcp."""
+    """Interactive setup wizard for waggle-mcp."""
     print()
-    print(_c(_BOLD, "graph-memory-mcp setup wizard"))
+    print(_c(_BOLD, "waggle-mcp setup wizard"))
     print(_c(_CYAN, "─" * 40))
 
     clients = list(_CLIENT_WRITERS.keys())
     client = _prompt_choice("Which MCP client are you using?", clients)
 
-    default_db = str(Path.home() / ".graph-memory" / "memory.db")
+    default_db = str(Path.home() / ".waggle" / "memory.db")
     db_path_raw = _prompt_path("Where should the database be stored?", default_db)
     db_path = str(Path(db_path_raw).expanduser().resolve())
 
@@ -1205,7 +1205,7 @@ def main() -> None:
 
     config = AppConfig.from_env()
     configure_logging(config.log_level)
-    LOGGER.info("graph_memory_startup")
+    LOGGER.info("waggle_startup")
     if command != "serve":
         _run_admin_command(config, args)
         return

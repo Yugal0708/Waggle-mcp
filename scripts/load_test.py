@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-graph-memory-mcp load tester
+waggle-mcp load tester
 ============================
 Sends concurrent HTTP MCP requests to the running service and reports
 p50 / p95 / p99 latency, throughput, and error rates.
@@ -258,7 +258,7 @@ async def run(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="graph-memory-mcp load tester")
+    parser = argparse.ArgumentParser(description="waggle-mcp load tester")
     parser.add_argument("--host", default="http://localhost:8080", help="Base URL of the MCP server")
     parser.add_argument("--api-key", required=True, dest="api_key", help="X-API-Key value")
     parser.add_argument("--duration", type=float, default=60.0, help="Test duration in seconds")

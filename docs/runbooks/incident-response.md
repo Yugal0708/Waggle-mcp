@@ -1,7 +1,7 @@
 # Runbook: Incident Response
 
 **Audience:** On-call engineer  
-**Applies to:** graph-memory-mcp in hosted HTTP mode  
+**Applies to:** waggle-mcp in hosted HTTP mode  
 **Last reviewed:** 2026-04-12
 
 ---
@@ -21,13 +21,13 @@
 
 **Symptoms:**
 - `/health/ready` returns HTTP 503
-- `graph_memory_tool_requests_total{status="error"}` spikes
+- `waggle_tool_requests_total{status="error"}` spikes
 - Logs contain `ServiceUnavailableError` or `neo4j.exceptions`
 
 **Steps:**
 1. Confirm Neo4j connectivity from within the pod:
    ```bash
-   kubectl exec -it deploy/graph-memory -- \
+   kubectl exec -it deploy/waggle -- \
      python -c "from neo4j import GraphDatabase; \
      GraphDatabase.driver('bolt://neo4j:7687', auth=('neo4j','change-me')).verify_connectivity()"
    ```
@@ -40,9 +40,9 @@
    ```bash
    kubectl rollout restart deployment/neo4j
    ```
-4. Once Neo4j is back, graph-memory readiness probe will recover automatically
+4. Once Neo4j is back, waggle readiness probe will recover automatically
    (no restart needed).
-5. If Neo4j is not in-cluster, verify the `GRAPH_MEMORY_NEO4J_URI` points to the
+5. If Neo4j is not in-cluster, verify the `WAGGLE_NEO4J_URI` points to the
    correct host and the network / firewall allows port 7687.
 
 ---
@@ -52,22 +52,22 @@
 **Symptoms:**
 - `store_node`, `query_graph`, `decompose_and_store` return errors
 - Startup log contains `embedding model` error
-- `graph_memory_startup_validation_seconds` metric absent
+- `waggle_startup_validation_seconds` metric absent
 
 **Steps:**
 1. Check pod logs for the model error:
    ```bash
-   kubectl logs deploy/graph-memory --tail=100 | grep -i embed
+   kubectl logs deploy/waggle --tail=100 | grep -i embed
    ```
 2. Common causes:
    - **Model not downloaded**: The HuggingFace model downloads on first boot.
      Increase `startupProbe.failureThreshold` or pull the model into the
      Docker image at build time.
-   - **Wrong model name**: Verify `GRAPH_MEMORY_MODEL` in the ConfigMap matches
+   - **Wrong model name**: Verify `WAGGLE_MODEL` in the ConfigMap matches
      a valid sentence-transformers model name.
 3. Force a pod restart after fixing config:
    ```bash
-   kubectl rollout restart deployment/graph-memory
+   kubectl rollout restart deployment/waggle
    ```
 
 ---
@@ -75,24 +75,24 @@
 ## Scenario 3 — Rate limit spike (429 storm)
 
 **Symptoms:**
-- `graph_memory_rate_limit_rejections_total` rises sharply
+- `waggle_rate_limit_rejections_total` rises sharply
 - Clients receive HTTP 429 responses
 
 **Steps:**
 1. Identify the offending API key from logs:
    ```bash
-   kubectl logs deploy/graph-memory --tail=200 \
+   kubectl logs deploy/waggle --tail=200 \
      | grep rate_lim | grep -oP '"api_key_id":"[^"]+"' | sort | uniq -c | sort -rn
    ```
 2. If a runaway agent is hammering the API, revoke its key:
    ```bash
-   graph-memory-mcp revoke-api-key --api-key-id <id>
+   waggle-mcp revoke-api-key --api-key-id <id>
    ```
 3. If legitimate traffic is hitting limits, temporarily raise the cap:
    ```bash
-   kubectl edit configmap graph-memory-config
-   # Increase GRAPH_MEMORY_RATE_LIMIT_RPM
-   kubectl rollout restart deployment/graph-memory
+   kubectl edit configmap waggle-config
+   # Increase WAGGLE_RATE_LIMIT_RPM
+   kubectl rollout restart deployment/waggle
    ```
 4. Long-term: tune rate limit values in `configmap.yaml` and re-apply.
 
@@ -101,7 +101,7 @@
 ## Scenario 4 — Sustained auth failures
 
 **Symptoms:**
-- `graph_memory_auth_failures_total` > baseline
+- `waggle_auth_failures_total` > baseline
 - Logs show `AuthenticationError: Invalid API key`
 
 **Steps:**
@@ -111,7 +111,7 @@
    and consider adding an IP allow-list annotation to the Ingress.
 3. If a key is compromised:
    ```bash
-   graph-memory-mcp revoke-api-key --api-key-id <compromised-id>
+   waggle-mcp revoke-api-key --api-key-id <compromised-id>
    ```
 
 ---
@@ -125,7 +125,7 @@
 **Steps:**
 1. Check current memory usage:
    ```bash
-   kubectl top pod -l app=graph-memory
+   kubectl top pod -l app=waggle
    ```
 2. Raise the memory limit in `deployment.yaml` and re-apply.
 3. If community detection (`get_topics`) is running on a very large graph, it
@@ -138,18 +138,18 @@
 
 ```bash
 # Tail live logs
-kubectl logs -f deploy/graph-memory
+kubectl logs -f deploy/waggle
 
 # Check recent events
 kubectl get events --sort-by=.lastTimestamp | tail -20
 
 # Port-forward for direct access
-kubectl port-forward svc/graph-memory 8080:80
+kubectl port-forward svc/waggle 8080:80
 curl http://localhost:8080/health/ready
 curl http://localhost:8080/metrics
 
 # Quick metric snapshot
-curl -s http://localhost:8080/metrics | grep graph_memory
+curl -s http://localhost:8080/metrics | grep waggle
 ```
 
 ---

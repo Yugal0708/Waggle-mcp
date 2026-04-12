@@ -1,7 +1,7 @@
 # Runbook: New Tenant Onboarding
 
 **Audience:** Platform team  
-**Applies to:** graph-memory-mcp in hosted HTTP mode  
+**Applies to:** waggle-mcp in hosted HTTP mode  
 **Last reviewed:** 2026-04-12
 
 ---
@@ -25,7 +25,7 @@ stamped with `tenant_id`; cross-tenant queries are not possible.
 ## Step 1 — Create the tenant
 
 ```bash
-graph-memory-mcp create-tenant \
+waggle-mcp create-tenant \
   --tenant-id <tenant-id> \
   --name "<Human Readable Name>"
 ```
@@ -37,7 +37,7 @@ This initialises the tenant's namespace in the backend (SQLite or Neo4j).
 ## Step 2 — Create the first API key
 
 ```bash
-graph-memory-mcp create-api-key \
+waggle-mcp create-api-key \
   --tenant-id <tenant-id> \
   --name "primary-agent"
 ```
@@ -55,7 +55,7 @@ Record the `api_key_id` in the key inventory.
 From your own shell with the new key:
 
 ```bash
-BASE=https://graph-memory.example.com
+BASE=https://waggle.example.com
 
 # Health check
 curl -sf -H "X-API-Key: <raw-key>" "$BASE/health/ready"
@@ -98,7 +98,7 @@ Add an entry to your internal tenant registry:
 Share with the tenant:
 
 - The raw API key (via secure channel).
-- The endpoint: `https://graph-memory.example.com/mcp`
+- The endpoint: `https://waggle.example.com/mcp`
 - Headers required: `Content-Type: application/json`, `X-API-Key: <key>`
 - The list of available MCP tools (from `README.md`).
 - Link to the API key rotation runbook: [api-key-rotation.md](./api-key-rotation.md).
@@ -109,9 +109,9 @@ Share with the tenant:
 
 ```bash
 # 1. Revoke all API keys for the tenant
-graph-memory-mcp list-api-keys --tenant-id <tenant-id>
-graph-memory-mcp revoke-api-key --api-key-id <id1>
-graph-memory-mcp revoke-api-key --api-key-id <id2>
+waggle-mcp list-api-keys --tenant-id <tenant-id>
+waggle-mcp revoke-api-key --api-key-id <id1>
+waggle-mcp revoke-api-key --api-key-id <id2>
 # ... repeat for all keys
 
 # 2. Export a final backup of their data before deletion (optional)

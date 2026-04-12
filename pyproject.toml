@@ -1,5 +1,5 @@
 [project]
-name = "graph-memory-mcp"
+name = "waggle-mcp"
 version = "0.1.0"
 description = "MCP server that gives LLMs persistent graph-structured memory"
 readme = "README.md"
@@ -41,7 +41,7 @@ neo4j = [
 ]
 
 [project.scripts]
-graph-memory-mcp = "graph_memory.server:main"
+waggle-mcp = "waggle.server:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -51,7 +51,7 @@ build-backend = "hatchling.build"
 dev-mode-dirs = ["src"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/graph_memory"]
+packages = ["src/waggle"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

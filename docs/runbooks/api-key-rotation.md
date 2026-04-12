@@ -1,7 +1,7 @@
 # Runbook: API Key Rotation
 
 **Audience:** Platform / ops team  
-**Applies to:** graph-memory-mcp HTTP (hosted) mode  
+**Applies to:** waggle-mcp HTTP (hosted) mode  
 **Last reviewed:** 2026-04-12
 
 ---
@@ -24,7 +24,7 @@ consumers, then revoke the old key.  No downtime is required.
 
 ```bash
 # Replace <tenant-id> and <name> with real values
-graph-memory-mcp create-api-key \
+waggle-mcp create-api-key \
   --tenant-id <tenant-id> \
   --name "ci-agent-rotated-$(date +%Y%m%d)"
 ```
@@ -44,16 +44,16 @@ monitoring scripts):
 2. Verify the consumer can authenticate:
    ```bash
    curl -sf -H "X-API-Key: <NEW_RAW_KEY>" \
-     https://graph-memory.example.com/health/ready
+     https://waggle.example.com/health/ready
    ```
 
 ### Step 3 — Verify no consumer is still using the old key
 
-Check the `/metrics` endpoint for `graph_memory_auth_failures_total`.
+Check the `/metrics` endpoint for `waggle_auth_failures_total`.
 A spike during this window may indicate a consumer still using the old key.
 
 ```bash
-curl -s https://graph-memory.example.com/metrics \
+curl -s https://waggle.example.com/metrics \
   | grep auth_failures
 ```
 
@@ -63,10 +63,10 @@ Allow a soak period (≥ 5 minutes) before proceeding.
 
 ```bash
 # Get the old key ID from the list command
-graph-memory-mcp list-api-keys --tenant-id <tenant-id>
+waggle-mcp list-api-keys --tenant-id <tenant-id>
 
 # Revoke by ID
-graph-memory-mcp revoke-api-key --api-key-id <old-api-key-id>
+waggle-mcp revoke-api-key --api-key-id <old-api-key-id>
 ```
 
 The old key is immediately rejected by the server; no restart required.
@@ -75,7 +75,7 @@ The old key is immediately rejected by the server; no restart required.
 
 ```bash
 curl -v -H "X-API-Key: <OLD_RAW_KEY>" \
-  https://graph-memory.example.com/health/ready
+  https://waggle.example.com/health/ready
 # Expect: HTTP 401
 ```
 
@@ -86,11 +86,11 @@ curl -v -H "X-API-Key: <OLD_RAW_KEY>" \
 If a key must be revoked immediately without a ready replacement:
 
 ```bash
-graph-memory-mcp revoke-api-key --api-key-id <compromised-key-id>
+waggle-mcp revoke-api-key --api-key-id <compromised-key-id>
 ```
 
 Then follow steps 1–4 above to issue and distribute a new key.
-Monitor `graph_memory_auth_failures_total` for the next 30 minutes.
+Monitor `waggle_auth_failures_total` for the next 30 minutes.
 
 ---
 

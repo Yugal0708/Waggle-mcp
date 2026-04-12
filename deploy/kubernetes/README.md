@@ -46,7 +46,7 @@ kubectl apply -f ingress.yaml
 ```bash
 # Copy the example, fill real values, apply — never commit secret.yaml to git
 cp secret.example.yaml secret.yaml
-# Edit GRAPH_MEMORY_NEO4J_USERNAME and GRAPH_MEMORY_NEO4J_PASSWORD
+# Edit WAGGLE_NEO4J_USERNAME and WAGGLE_NEO4J_PASSWORD
 kubectl apply -f secret.yaml
 ```
 
@@ -54,14 +54,14 @@ kubectl apply -f secret.yaml
 
 ## Replace the image reference
 
-`deployment.yaml` uses `graph-memory-mcp:latest` as a placeholder.
+`deployment.yaml` uses `waggle-mcp:latest` as a placeholder.
 Push your image to a registry and update the field:
 
 ```bash
 # Example using Docker Hub
-docker build -t yourorg/graph-memory-mcp:v0.1.0 .
-docker push yourorg/graph-memory-mcp:v0.1.0
-# Then update deployment.yaml:  image: yourorg/graph-memory-mcp:v0.1.0
+docker build -t yourorg/waggle-mcp:v0.1.0 .
+docker push yourorg/waggle-mcp:v0.1.0
+# Then update deployment.yaml:  image: yourorg/waggle-mcp:v0.1.0
 kubectl apply -f deployment.yaml
 ```
 
@@ -71,16 +71,16 @@ kubectl apply -f deployment.yaml
 
 ```bash
 # Watch pods come up
-kubectl rollout status deployment/graph-memory
+kubectl rollout status deployment/waggle
 
 # Check health endpoints via port-forward
-kubectl port-forward svc/graph-memory 8080:80
+kubectl port-forward svc/waggle 8080:80
 curl http://localhost:8080/health/ready
 curl http://localhost:8080/health/live
 curl http://localhost:8080/metrics
 
 # Check HPA status after a few minutes
-kubectl get hpa graph-memory
+kubectl get hpa waggle
 ```
 
 ---
@@ -89,10 +89,10 @@ kubectl get hpa graph-memory
 
 ```bash
 # After DNS is pointed at the ingress controller's external IP:
-curl -v https://graph-memory.example.com/health/ready
+curl -v https://waggle.example.com/health/ready
 
 # Check cert-manager issued the certificate
-kubectl describe certificate graph-memory-tls
+kubectl describe certificate waggle-tls
 kubectl get certificaterequest
 ```
 
@@ -101,9 +101,9 @@ kubectl get certificaterequest
 ## Rollback
 
 ```bash
-kubectl rollout undo deployment/graph-memory
+kubectl rollout undo deployment/waggle
 # Or to a specific revision:
-kubectl rollout undo deployment/graph-memory --to-revision=2
+kubectl rollout undo deployment/waggle --to-revision=2
 ```
 
 ---
@@ -114,6 +114,6 @@ kubectl rollout undo deployment/graph-memory --to-revision=2
 |---------|-------|
 | Pods stuck in `Pending` | `kubectl describe pod <name>` → resource limits, node capacity |
 | Readiness probe failing | `kubectl logs <pod>` — embedding model may still be downloading |
-| TLS certificate not issued | `kubectl describe certificate graph-memory-tls` → cert-manager events |
+| TLS certificate not issued | `kubectl describe certificate waggle-tls` → cert-manager events |
 | 401 from `/mcp` | Ensure `X-API-Key` header is set to a valid active key |
-| Rate-limit 429 from `/mcp` | Adjust `GRAPH_MEMORY_RATE_LIMIT_RPM` in configmap.yaml |
+| Rate-limit 429 from `/mcp` | Adjust `WAGGLE_RATE_LIMIT_RPM` in configmap.yaml |

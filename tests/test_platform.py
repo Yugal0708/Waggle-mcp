@@ -7,13 +7,13 @@ import numpy as np
 import pytest
 from starlette.testclient import TestClient
 
-from graph_memory.auth import hash_api_key, verify_api_key
-from graph_memory.config import AppConfig
-from graph_memory.errors import RateLimitExceededError
-from graph_memory.graph import MemoryGraph
-from graph_memory.models import NodeType
-from graph_memory.rate_limit import RateLimiter
-from graph_memory.server import GraphMemoryServer, create_http_application
+from waggle.auth import hash_api_key, verify_api_key
+from waggle.config import AppConfig
+from waggle.errors import RateLimitExceededError
+from waggle.graph import MemoryGraph
+from waggle.models import NodeType
+from waggle.rate_limit import RateLimiter
+from waggle.server import WaggleServer, create_http_application
 
 
 class FakeEmbeddingModel:
@@ -130,7 +130,7 @@ def test_backup_round_trip_preserves_schema_and_tenant_metadata(tmp_path: Path) 
 
 def test_http_app_health_auth_and_metrics(tmp_path: Path) -> None:
     graph = make_graph(tmp_path)
-    app_server = GraphMemoryServer(graph=graph, config=make_http_config(tmp_path))
+    app_server = WaggleServer(graph=graph, config=make_http_config(tmp_path))
     created = graph.create_api_key("tenant-http", "http-test")
     app = create_http_application(app_server, app_server.config)
 
@@ -152,14 +152,14 @@ def test_http_app_health_auth_and_metrics(tmp_path: Path) -> None:
 
         metrics = client.get("/metrics")
         assert metrics.status_code == 200
-        assert "graph_memory_http_requests_total" in metrics.text
-        assert "graph_memory_ready" in metrics.text
+        assert "waggle_http_requests_total" in metrics.text
+        assert "waggle_ready" in metrics.text
 
 
 def test_http_app_rate_limit_and_payload_limit(tmp_path: Path) -> None:
     graph = make_graph(tmp_path)
     config = make_http_config(tmp_path, rate_limit_rpm=1, max_payload_bytes=256)
-    app_server = GraphMemoryServer(graph=graph, config=config)
+    app_server = WaggleServer(graph=graph, config=config)
     created = graph.create_api_key("tenant-http", "http-test")
     app = create_http_application(app_server, config)
 

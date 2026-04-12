@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from graph_memory.models import (
+from waggle.models import (
     GraphDiffResult,
     GraphStats,
     Node,

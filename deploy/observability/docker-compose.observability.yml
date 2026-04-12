@@ -1,7 +1,7 @@
 version: "3.9"
 
 # One-command local observability stack.
-# Assumes graph-memory-mcp is already running (or started separately).
+# Assumes waggle-mcp is already running (or started separately).
 #
 # Usage:
 #   docker compose -f deploy/observability/docker-compose.observability.yml up -d
@@ -9,21 +9,21 @@ version: "3.9"
 #   # Prometheus → http://localhost:9090
 
 services:
-  # ── graph-memory-mcp ─────────────────────────────────────────────────────
-  # (Comment this block out if you run graph-memory-mcp separately.)
-  graph-memory:
-    image: graph-memory-mcp:latest
+  # ── waggle-mcp ─────────────────────────────────────────────────────
+  # (Comment this block out if you run waggle-mcp separately.)
+  waggle:
+    image: waggle-mcp:latest
     environment:
-      GRAPH_MEMORY_TRANSPORT: http
-      GRAPH_MEMORY_BACKEND: neo4j
-      GRAPH_MEMORY_HTTP_HOST: "0.0.0.0"
-      GRAPH_MEMORY_HTTP_PORT: "8080"
-      GRAPH_MEMORY_DEFAULT_TENANT_ID: workspace-default
-      GRAPH_MEMORY_LOG_LEVEL: INFO
-      GRAPH_MEMORY_NEO4J_URI: bolt://neo4j:7687
-      GRAPH_MEMORY_NEO4J_USERNAME: neo4j
-      GRAPH_MEMORY_NEO4J_PASSWORD: change-me
-      GRAPH_MEMORY_NEO4J_DATABASE: neo4j
+      WAGGLE_TRANSPORT: http
+      WAGGLE_BACKEND: neo4j
+      WAGGLE_HTTP_HOST: "0.0.0.0"
+      WAGGLE_HTTP_PORT: "8080"
+      WAGGLE_DEFAULT_TENANT_ID: workspace-default
+      WAGGLE_LOG_LEVEL: INFO
+      WAGGLE_NEO4J_URI: bolt://neo4j:7687
+      WAGGLE_NEO4J_USERNAME: neo4j
+      WAGGLE_NEO4J_PASSWORD: change-me
+      WAGGLE_NEO4J_DATABASE: neo4j
     ports:
       - "8080:8080"
     depends_on:
@@ -73,7 +73,7 @@ services:
       - ./grafana-provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       # Auto-provision the dashboard
       - ./grafana-provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
-      - ./grafana-dashboard.json:/var/lib/grafana/dashboards/graph-memory.json:ro
+      - ./grafana-dashboard.json:/var/lib/grafana/dashboards/waggle.json:ro
     ports:
       - "3000:3000"
     depends_on:

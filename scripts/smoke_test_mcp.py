@@ -20,12 +20,12 @@ async def main() -> None:
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "src")
-    env["GRAPH_MEMORY_DB_PATH"] = str(db_path)
-    env["GRAPH_MEMORY_MODEL"] = env.get("GRAPH_MEMORY_MODEL", "all-MiniLM-L6-v2")
+    env["WAGGLE_DB_PATH"] = str(db_path)
+    env["WAGGLE_MODEL"] = env.get("WAGGLE_MODEL", "all-MiniLM-L6-v2")
 
     server_params = StdioServerParameters(
         command=sys.executable,
-        args=["-m", "graph_memory.server"],
+        args=["-m", "waggle.server"],
         cwd=str(ROOT),
         env=env,
     )

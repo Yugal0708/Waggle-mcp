@@ -13,11 +13,11 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 async def test_server_stdio_initialize_and_basic_calls(tmp_path: Path) -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = str((Path(__file__).resolve().parents[1] / "src"))
-    env["GRAPH_MEMORY_DB_PATH"] = str(tmp_path / "integration-memory.db")
+    env["WAGGLE_DB_PATH"] = str(tmp_path / "integration-memory.db")
 
     server_params = StdioServerParameters(
         command=sys.executable,
-        args=["-m", "graph_memory.server"],
+        args=["-m", "waggle.server"],
         cwd=str(Path(__file__).resolve().parents[1]),
         env=env,
     )
@@ -25,7 +25,7 @@ async def test_server_stdio_initialize_and_basic_calls(tmp_path: Path) -> None:
     async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             init_result = await session.initialize()
-            assert init_result.serverInfo.name == "graph-memory"
+            assert init_result.serverInfo.name == "waggle"
 
             tools_result = await session.list_tools()
             assert len(tools_result.tools) == 15

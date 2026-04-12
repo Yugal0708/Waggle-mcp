@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # backup_restore_drill.sh
-# End-to-end backup → restore drill against a running graph-memory-mcp HTTP server.
+# End-to-end backup → restore drill against a running waggle-mcp HTTP server.
 #
 # Usage:
-#   GRAPH_MEMORY_HOST=http://localhost:8080 \
-#   GRAPH_MEMORY_API_KEY=<key> \
+#   WAGGLE_HOST=http://localhost:8080 \
+#   WAGGLE_API_KEY=<key> \
 #   ./scripts/backup_restore_drill.sh
 #
 # Exit codes: 0 = PASS, 1 = FAIL
 set -euo pipefail
 
-HOST="${GRAPH_MEMORY_HOST:-http://localhost:8080}"
-API_KEY="${GRAPH_MEMORY_API_KEY:-}"
-TENANT="${GRAPH_MEMORY_TENANT_ID:-workspace-default}"
+HOST="${WAGGLE_HOST:-http://localhost:8080}"
+API_KEY="${WAGGLE_API_KEY:-}"
+TENANT="${WAGGLE_TENANT_ID:-workspace-default}"
 
 if [[ -z "$API_KEY" ]]; then
-  echo "ERROR: GRAPH_MEMORY_API_KEY must be set."
+  echo "ERROR: WAGGLE_API_KEY must be set."
   exit 1
 fi
 
@@ -46,7 +46,7 @@ check() {
 }
 
 echo "=============================="
-echo " graph-memory-mcp Backup/Restore Drill"
+echo " waggle-mcp Backup/Restore Drill"
 echo " Host   : $HOST"
 echo " Tenant : $TENANT"
 echo "=============================="

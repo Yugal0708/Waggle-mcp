@@ -10,7 +10,7 @@ class ErrorPayload:
     status_code: int = 400
 
 
-class GraphMemoryError(Exception):
+class WaggleError(Exception):
     def __init__(self, code: str, message: str, *, status_code: int = 400) -> None:
         super().__init__(message)
         self.payload = ErrorPayload(code=code, message=message, status_code=status_code)
@@ -24,31 +24,31 @@ class GraphMemoryError(Exception):
         return self.payload.status_code
 
 
-class AuthenticationError(GraphMemoryError):
+class AuthenticationError(WaggleError):
     def __init__(self, message: str = "Authentication failed.") -> None:
         super().__init__("authentication_failed", message, status_code=401)
 
 
-class AuthorizationError(GraphMemoryError):
+class AuthorizationError(WaggleError):
     def __init__(self, message: str = "Not authorized to perform this action.") -> None:
         super().__init__("authorization_failed", message, status_code=403)
 
 
-class RateLimitExceededError(GraphMemoryError):
+class RateLimitExceededError(WaggleError):
     def __init__(self, message: str = "Rate limit exceeded.") -> None:
         super().__init__("rate_limited", message, status_code=429)
 
 
-class PayloadTooLargeError(GraphMemoryError):
+class PayloadTooLargeError(WaggleError):
     def __init__(self, message: str = "Payload too large.") -> None:
         super().__init__("payload_too_large", message, status_code=413)
 
 
-class ServiceUnavailableError(GraphMemoryError):
+class ServiceUnavailableError(WaggleError):
     def __init__(self, message: str = "Service unavailable.") -> None:
         super().__init__("service_unavailable", message, status_code=503)
 
 
-class ValidationFailure(GraphMemoryError):
+class ValidationFailure(WaggleError):
     def __init__(self, message: str) -> None:
         super().__init__("validation_failed", message, status_code=400)

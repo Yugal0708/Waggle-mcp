@@ -1,7 +1,7 @@
 # Runbook: Secret Management
 
 **Audience:** Platform team  
-**Applies to:** graph-memory-mcp Kubernetes deployment  
+**Applies to:** waggle-mcp Kubernetes deployment  
 **Last reviewed:** 2026-04-12
 
 ---
@@ -28,8 +28,8 @@ secrets backend.
 # Copy the example and fill real values
 cp deploy/kubernetes/secret.example.yaml deploy/kubernetes/secret.yaml
 
-# Edit secret.yaml — set GRAPH_MEMORY_NEO4J_USERNAME and
-# GRAPH_MEMORY_NEO4J_PASSWORD to real values.
+# Edit secret.yaml — set WAGGLE_NEO4J_USERNAME and
+# WAGGLE_NEO4J_PASSWORD to real values.
 # IMPORTANT: add secret.yaml to .gitignore immediately.
 
 echo "deploy/kubernetes/secret.yaml" >> .gitignore
@@ -75,7 +75,7 @@ spec:
 
 ```bash
 aws secretsmanager create-secret \
-  --name prod/graph-memory/neo4j \
+  --name prod/waggle/neo4j \
   --secret-string '{"username":"neo4j","password":"<real-password>"}'
 ```
 
@@ -88,13 +88,13 @@ cp deploy/kubernetes/external-secret.example.yaml \
 kubectl apply -f deploy/kubernetes/external-secret.yaml
 ```
 
-The operator will create and keep `graph-memory-secret` in sync.
+The operator will create and keep `waggle-secret` in sync.
 The deployment picks up changes on pod restart or via a rolling update.
 
 ### Verify sync
 
 ```bash
-kubectl get externalsecret graph-memory-secret
+kubectl get externalsecret waggle-secret
 # READY column should show True or Synced
 ```
 
@@ -111,17 +111,17 @@ kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/
 ### Apply issuers and certificate
 
 ```bash
-# Edit certificate.yaml: replace ops@example.com and graph-memory.example.com
+# Edit certificate.yaml: replace ops@example.com and waggle.example.com
 kubectl apply -f deploy/kubernetes/certificate.yaml
 ```
 
 ### Verify certificate issuance
 
 ```bash
-kubectl describe certificate graph-memory-tls
+kubectl describe certificate waggle-tls
 # Look for: "Certificate is up to date and has not expired"
 
-kubectl get secret graph-memory-tls -o jsonpath='{.data.tls\.crt}' \
+kubectl get secret waggle-tls -o jsonpath='{.data.tls\.crt}' \
   | base64 -d | openssl x509 -noout -dates
 ```
 
@@ -145,16 +145,16 @@ kubectl get secret graph-memory-tls -o jsonpath='{.data.tls\.crt}' \
 1. Update the secret in your external store (AWS Secrets Manager / Vault):
    ```bash
    aws secretsmanager put-secret-value \
-     --secret-id prod/graph-memory/neo4j \
+     --secret-id prod/waggle/neo4j \
      --secret-string '{"username":"neo4j","password":"<new-password>"}'
    ```
 2. The External Secrets Operator syncs within `refreshInterval` (default 2 min).
 3. Trigger a rolling restart to pick up the new secret:
    ```bash
-   kubectl rollout restart deployment/graph-memory
+   kubectl rollout restart deployment/waggle
    ```
 4. Also update the Neo4j server to accept the new password before restarting
-   graph-memory to avoid a gap.
+   waggle to avoid a gap.
 
 ---
 

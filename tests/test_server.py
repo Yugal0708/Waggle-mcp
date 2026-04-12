@@ -5,10 +5,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from graph_memory.graph import MemoryGraph
-from graph_memory.models import NodeType
-from graph_memory.config import AppConfig
-from graph_memory.server import GraphMemoryServer, _default_graph
+from waggle.graph import MemoryGraph
+from waggle.models import NodeType
+from waggle.config import AppConfig
+from waggle.server import WaggleServer, _default_graph
 
 
 class FakeEmbeddingModel:
@@ -36,7 +36,7 @@ class FakeEmbeddingModel:
         return float(np.dot(a, b) / (a_norm * b_norm))
 
 
-def make_app(tmp_path: Path) -> GraphMemoryServer:
+def make_app(tmp_path: Path) -> WaggleServer:
     graph = MemoryGraph(tmp_path / "server-memory.db", FakeEmbeddingModel())
     config = AppConfig(
         backend="sqlite",
@@ -58,7 +58,7 @@ def make_app(tmp_path: Path) -> GraphMemoryServer:
         neo4j_password="",
         neo4j_database="",
     )
-    return GraphMemoryServer(graph=graph, config=config)
+    return WaggleServer(graph=graph, config=config)
 
 
 def test_store_node_and_stats_tool(tmp_path: Path) -> None:
@@ -297,8 +297,8 @@ def test_tool_payload_limit_is_enforced(tmp_path: Path) -> None:
 
 
 def test_default_graph_uses_sqlite_backend_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GRAPH_MEMORY_BACKEND", raising=False)
-    monkeypatch.setenv("GRAPH_MEMORY_DB_PATH", str(tmp_path / "sqlite-memory.db"))
+    monkeypatch.delenv("WAGGLE_BACKEND", raising=False)
+    monkeypatch.setenv("WAGGLE_DB_PATH", str(tmp_path / "sqlite-memory.db"))
 
     graph = _default_graph()
 
@@ -313,16 +313,16 @@ def test_default_graph_can_build_neo4j_backend(tmp_path: Path, monkeypatch: pyte
         def __init__(self, **kwargs: object) -> None:
             captured.update(kwargs)
 
-    import graph_memory.neo4j_graph as neo4j_graph_module
+    import waggle.neo4j_graph as neo4j_graph_module
 
     monkeypatch.setattr(neo4j_graph_module, "Neo4jMemoryGraph", FakeNeo4jGraph)
-    monkeypatch.setenv("GRAPH_MEMORY_BACKEND", "neo4j")
-    monkeypatch.setenv("GRAPH_MEMORY_MODEL", "fake-model")
-    monkeypatch.setenv("GRAPH_MEMORY_EXPORT_DIR", str(tmp_path / "exports"))
-    monkeypatch.setenv("GRAPH_MEMORY_NEO4J_URI", "bolt://localhost:7687")
-    monkeypatch.setenv("GRAPH_MEMORY_NEO4J_USERNAME", "neo4j")
-    monkeypatch.setenv("GRAPH_MEMORY_NEO4J_PASSWORD", "secret")
-    monkeypatch.setenv("GRAPH_MEMORY_NEO4J_DATABASE", "memory")
+    monkeypatch.setenv("WAGGLE_BACKEND", "neo4j")
+    monkeypatch.setenv("WAGGLE_MODEL", "fake-model")
+    monkeypatch.setenv("WAGGLE_EXPORT_DIR", str(tmp_path / "exports"))
+    monkeypatch.setenv("WAGGLE_NEO4J_URI", "bolt://localhost:7687")
+    monkeypatch.setenv("WAGGLE_NEO4J_USERNAME", "neo4j")
+    monkeypatch.setenv("WAGGLE_NEO4J_PASSWORD", "secret")
+    monkeypatch.setenv("WAGGLE_NEO4J_DATABASE", "memory")
 
     graph = _default_graph()
 
@@ -335,10 +335,10 @@ def test_default_graph_can_build_neo4j_backend(tmp_path: Path, monkeypatch: pyte
 
 
 def test_default_graph_requires_neo4j_connection_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GRAPH_MEMORY_BACKEND", "neo4j")
-    monkeypatch.delenv("GRAPH_MEMORY_NEO4J_URI", raising=False)
-    monkeypatch.delenv("GRAPH_MEMORY_NEO4J_USERNAME", raising=False)
-    monkeypatch.delenv("GRAPH_MEMORY_NEO4J_PASSWORD", raising=False)
+    monkeypatch.setenv("WAGGLE_BACKEND", "neo4j")
+    monkeypatch.delenv("WAGGLE_NEO4J_URI", raising=False)
+    monkeypatch.delenv("WAGGLE_NEO4J_USERNAME", raising=False)
+    monkeypatch.delenv("WAGGLE_NEO4J_PASSWORD", raising=False)
 
     with pytest.raises(RuntimeError, match="Neo4j backend requires"):
         _default_graph()
