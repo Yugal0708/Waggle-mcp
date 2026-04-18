@@ -24,7 +24,7 @@
 
 ## Why waggle-mcp?
 
-`waggle-mcp` is a local-first memory layer for MCP-compatible AI clients, built on a persistent knowledge graph. It gives your AI a persistent knowledge graph it can read and write through any MCP-compatible client (Clause Desktop, Cursor, Codex, Antigravity, etc.).
+`waggle-mcp` is a local-first memory layer for MCP-compatible AI clients, built on a persistent knowledge graph. It gives your AI a persistent knowledge graph it can read and write through any MCP-compatible client (Claude Desktop, Cursor, Codex, Antigravity, etc.).
 
 | Stuffed context | Structured retrieval |
 |-----------------|----------------------|
@@ -85,7 +85,7 @@ Agent: [calls store_node() + store_edge(new_node → old_node, "contradicts")]
 - **Portable Context**: `export_context_bundle` generates Markdown/JSON context packs for another AI.
 - **Vault Round-trip**: `export_markdown_vault` / `import_markdown_vault` for Obsidian-style node editing.
 - **Conflict Resolution**: `list_conflicts` / `resolve_conflict` to manage contradictions without losing history.
-- **Deterministic Integrity**: Uses a stable deterministic parser and SHA-256 embeddings for reliable, local-first operation.
+- **Deterministic Fallback**: Stable SHA-256 hashing for reliable, reproducible offline operation when transformer models are unavailable.
 
 ---
 
