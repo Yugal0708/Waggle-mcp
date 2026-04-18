@@ -51,6 +51,42 @@ waggle-mcp init
 
 `init` detects your MCP client, writes its config, and creates the local database directory. Default mode is local SQLite with on-device embeddings.
 
+### Antigravity (https://antigravity.google)
+
+Antigravity supports MCP servers, but the config format can vary by version/build. Add Waggle to Antigravity's MCP config, then fully restart Antigravity so it reloads MCP tools.
+
+**Option A: Antigravity `mcp_config.json` (UI: MCP Servers → Manage → View raw config)**
+
+Add a `waggle` entry under `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "waggle": {
+      "command": "/absolute/path/to/python",
+      "args": ["-m", "waggle.server"]
+    }
+  }
+}
+```
+
+**Option B: Project-level `.vscode/mcp.json` (VS Code MCP format)**
+
+Some Antigravity setups use a project file with a top-level `servers` object:
+
+```json
+{
+  "servers": {
+    "waggle": {
+      "command": "/absolute/path/to/python",
+      "args": ["-m", "waggle.server"]
+    }
+  }
+}
+```
+
+Tip: set `command` to the exact Python where Waggle is installed (often your venv's `.../.venv/bin/python`, or whatever `which python3` returns in that environment).
+
 ---
 
 ## See it in action
