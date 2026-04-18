@@ -34,6 +34,17 @@
 
 ---
 
+## Who is this for?
+
+**→ Individual developer** extending Claude, Codex, Cursor, or Antigravity with persistent memory:
+`pip install waggle-mcp && waggle-mcp init` and you're done. SQLite + local embeddings, zero infra.
+
+**→ Team running a shared memory service:** Waggle ships with a Docker image, Kubernetes manifests, Prometheus metrics, and multi-tenant auth. See [deploy/kubernetes/](./deploy/kubernetes/) and [docs/runbooks/](./docs/runbooks/).
+
+Both paths share the same MCP tool surface — the difference is only the backend and transport.
+
+---
+
 ## Why waggle-mcp?
 
 `waggle-mcp` is a local-first memory layer for MCP-compatible AI clients, built on a persistent knowledge graph. It gives your AI a persistent knowledge graph it can read and write through any MCP-compatible client (Claude Desktop, Cursor, Codex, Antigravity, etc.).
@@ -60,6 +71,11 @@ waggle-mcp init
 `init` detects your MCP client, writes its config, and creates the local database directory. Default mode is local SQLite with on-device embeddings. Antigravity and manual configuration details are in [docs/reference.md](./docs/reference.md).
 
 Manual MCP setup examples for **Codex**, **Claude Code**, **Cursor**, and **Antigravity** are in [docs/reference.md](./docs/reference.md#manual-client-configuration).
+
+> **⚠️ Edges are what make graph memory work.**
+> `observe_conversation` and `decompose_and_store` create edges automatically.
+> If you only call `store_node`, you get isolated facts — not a connected graph.
+> Always prefer `observe_conversation` for conversational ingestion.
 
 ---
 
@@ -279,37 +295,34 @@ Agent: [calls store_node() + store_edge(new_node → old_node, "contradicts")]
 
 ## Benchmarks & Verification
 
-Waggle performance is verified against checked-in fixtures and automated regression tests.
+### External Benchmark — LongMemEval
 
-### Project Fixtures
+**`81.6% R@5` on the held-out split (500 questions).** This is the number that matters for generalization — it was not used during development.
+
+The full-split ceiling is `97.4% R@5` (retrieval on the saved benchmark setup), included for completeness in [tests/artifacts/README.md](./tests/artifacts/README.md). The gap reflects the difference between in-distribution retrieval and held-out generalization — both numbers are real, the held-out one is the honest one.
+
+### Internal Fixtures
+
 | Area | Corpus | Result |
 |------|--------|--------|
 | Extraction | 25-case deterministic fixture | `100.0%` |
 | Retrieval | 18-query retrieval fixture | `83.3% Hit@k` |
 | Query stress | 40 adversarial retrieval-only cases | `97.5% Hit@k`, `97.5% exact support` |
-| Deduplication | 22 cases (semi-semantic) | `0` false merges at the selected threshold; `77.3%` overall due to conservative false negatives |
+| Deduplication | 22 cases (semi-semantic) | `0` false merges at threshold; `77.3%` overall (conservative false negatives — improving in 0.1.8) |
 | Automated tests | Infrastructure & logic | `91 passed` |
 
-### External Benchmarks
-| Benchmark | Coverage | Metric | Status |
-|-----------|----------|--------|--------|
-| **LongMemEval** | 500 questions | `81.6% R@5` held-out deterministic | Verified |
+**Deduplication note:** Zero false-positive merges is the safety invariant. The 77.3% overall accuracy is intentionally conservative — the system prefers a missed merge over a wrong merge. Improving recall without introducing false positives is the active work for 0.1.8.
 
-- **LongMemEval note**: The checked-in full-split `97.4% R@5` result is useful as a retrieval ceiling on the saved benchmark setup, but the held-out `81.6%` split is the more honest number for generalization.
-- **Deduplication**: Zero false-positive merges across the threshold sweep. Accuracy limited by conservative similarity bounds.
-- **Comparative benchmark note**: The comparative Waggle-vs-RAG corpus is still evolving. For current per-family/token numbers, use the checked-in artifact index in [tests/artifacts/README.md](./tests/artifacts/README.md) rather than this top-level summary.
-
-Detailed benchmark artifacts and the new **[Benchmark Methodology](./docs/benchmark-methodology.md)** guide provide full traceability.
+Detailed artifacts and methodology: **[Benchmark Methodology](./docs/benchmark-methodology.md)** · [tests/artifacts/README.md](./tests/artifacts/README.md)
 
 ---
 
 ## Known Limitations
 
-- **Best on structured recall, weaker on benchmark-style answer synthesis**: Waggle is strongest when the problem is "retrieve the right facts and relationships" rather than "emit one benchmark-formatted final answer from memory."
-- **Edges matter**: Isolated `store_node` writes do not create graph context by themselves. Connected context comes from `store_edge`, `observe_conversation`, `decompose_and_store`, and automatic contradiction/update detection.
-- **Graph retrieval is not always the cheapest mode**: factual lookups are often much cheaper than chunked RAG, but graph-expansion queries intentionally use more tokens to carry reasoning context.
-- **Deduplication is conservative by design**: the system prefers missed merges over unsafe merges, which protects correctness but leaves some semantically similar duplicates unmerged.
-- **README numbers are intentionally narrow**: only the most stable benchmark claims are summarized here; per-family and evolving comparative numbers live in the artifact docs instead.
+- **Best on structured recall, weaker on answer synthesis**: Waggle is strongest at "retrieve the right facts and relationships" — not at emitting a single benchmark-formatted final answer from memory.
+- **Edges are load-bearing**: `observe_conversation` and `decompose_and_store` create them automatically. Raw `store_node` calls without follow-up edges produce disconnected nodes with no traversal value.
+- **Graph retrieval trades tokens for reasoning context**: factual lookups are often cheaper than chunked RAG; graph-expansion queries intentionally spend more tokens to carry update chains and contradictions.
+- **Deduplication recall is conservative (77.3%)**: zero false-positive merges is maintained, but recall will improve in 0.1.8.
 
 For operational details, scaling considerations, tool-level behavior, and the full MCP feature surface, see [docs/reference.md](./docs/reference.md).
 
