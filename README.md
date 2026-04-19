@@ -51,7 +51,7 @@ Both paths share the same MCP tool surface — the difference is only the backen
 
 ## Why waggle-mcp?
 
-`waggle-mcp` is a local-first memory layer for MCP-compatible AI clients, built on a persistent knowledge graph. It gives your AI a persistent knowledge graph it can read and write through any MCP-compatible client (Claude Desktop, Cursor, Codex, Antigravity, etc.).
+`waggle-mcp` is a local-first memory layer for MCP-compatible AI clients, built on a persistent knowledge graph.
 
 | Stuffed context | Structured retrieval |
 |-----------------|----------------------|
@@ -190,8 +190,7 @@ Then open a **fresh session** and ask:
 Expected result (example):
 
 ```text
-You decided on PostgreSQL for this project.
-Reason captured: MySQL replication had been painful.
+You're using PostgreSQL for this project.
 ```
 
 If you see that kind of recall in a new session, you're live.
