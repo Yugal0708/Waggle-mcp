@@ -793,7 +793,12 @@ class WaggleServer:
         graph = self.current_graph()
         started = time.perf_counter()
         graph.ensure_tenant(graph.tenant_id)
-        graph.embedding_model.embed("startup validation")
+        # Startup should not fail tool inspection just because embedding warmup fails
+        # (e.g., transient model cache/network issues in hosted inspectors).
+        try:
+            graph.embedding_model.embed("startup validation")
+        except Exception:
+            LOGGER.exception("startup_embedding_warmup_failed")
         self.metrics.observe("waggle_startup_validation_seconds", time.perf_counter() - started, backend=self.config.backend)
 
     def build_resources(self) -> types.ListResourcesResult:
