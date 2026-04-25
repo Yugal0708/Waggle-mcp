@@ -113,12 +113,30 @@ def serialize_stats(stats: GraphStats) -> str:
         "=== Memory Graph Stats ===",
         f"Total nodes: {stats.total_nodes}",
         f"Total edges: {stats.total_edges}",
+        f"Repos: {stats.total_repos}",
+        f"Context windows: {stats.total_context_windows}",
+        f"Cross-window edges: {stats.total_context_window_edges}",
+        f"Windows with embeddings: {stats.windows_with_embeddings} (stale: {stats.windows_with_stale_embeddings})",
         "",
         "[NODE TYPES]",
     ]
 
     for node_type, count in stats.node_type_breakdown.items():
         lines.append(f"• {node_type}: {count}")
+
+    lines.extend(["", "[CONTEXT WINDOWS]"])
+    if stats.context_window_status_breakdown:
+        for status, count in stats.context_window_status_breakdown.items():
+            lines.append(f"• {status}: {count}")
+    else:
+        lines.append("• No context windows stored yet.")
+
+    lines.extend(["", "[CROSS-WINDOW EDGE TYPES]"])
+    if stats.context_window_edge_type_breakdown:
+        for edge_type, count in stats.context_window_edge_type_breakdown.items():
+            lines.append(f"• {edge_type}: {count}")
+    else:
+        lines.append("• No cross-window edges stored yet.")
 
     lines.extend(["", "[MOST CONNECTED]"])
     if stats.most_connected_nodes:

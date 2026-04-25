@@ -28,11 +28,15 @@ async def test_server_stdio_initialize_and_basic_calls(tmp_path: Path) -> None:
             assert init_result.serverInfo.name == "waggle"
 
             tools_result = await session.list_tools()
-            assert len(tools_result.tools) == 23
+            assert len(tools_result.tools) == 28
             assert {tool.name for tool in tools_result.tools} >= {
                 "store_node",
                 "query_graph",
+                "debug_retrieval",
                 "list_context_scopes",
+                "list_context_windows",
+                "get_context_window",
+                "close_context_window",
                 "get_node_history",
                 "timeline",
                 "list_conflicts",
@@ -43,6 +47,7 @@ async def test_server_stdio_initialize_and_basic_calls(tmp_path: Path) -> None:
                 "get_topics",
                 "get_stats",
                 "export_graph_html",
+                "window_graph_viz",
                 "export_graph_backup",
                 "export_context_bundle",
                 "export_markdown_vault",
@@ -51,10 +56,11 @@ async def test_server_stdio_initialize_and_basic_calls(tmp_path: Path) -> None:
             }
 
             resources_result = await session.list_resources()
-            assert len(resources_result.resources) == 3
+            assert len(resources_result.resources) == 4
             assert {str(resource.uri) for resource in resources_result.resources} == {
                 "graph://stats",
                 "graph://recent",
+                "graph://windows",
                 "graph://memory-policy",
             }
 

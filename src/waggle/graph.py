@@ -64,6 +64,8 @@ from waggle.models import (
     BackupResult,
     ConflictEntry,
     ConflictListResult,
+    ContextWindow,
+    ContextWindowEdge,
     ConflictRecord,
     ConnectedNodeStat,
     ContextBundleExportResult,
@@ -99,7 +101,7 @@ from waggle.models import (
     utc_now,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 LOGGER = logging.getLogger(__name__)
 
@@ -238,10 +240,6 @@ MUST_PAIR_RELATIONS: frozenset[str] = frozenset({
     "depends_on",
 })
 
-
-SCHEMA_VERSION = 4
-
-
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -272,6 +270,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     agent_id TEXT DEFAULT '',
     project TEXT DEFAULT '',
     session_id TEXT DEFAULT '',
+    context_window_id TEXT DEFAULT NULL,
     label TEXT NOT NULL,
     content TEXT NOT NULL,
     node_type TEXT NOT NULL CHECK(
@@ -287,6 +286,54 @@ CREATE TABLE IF NOT EXISTS nodes (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     access_count INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS repos (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL DEFAULT 'local-default',
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(tenant_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS context_windows (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL DEFAULT 'local-default',
+    repo_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    title TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'closed', 'archived')),
+    node_count INTEGER DEFAULT 0,
+    embedding BLOB,
+    embedding_stale INTEGER DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    closed_at TEXT DEFAULT NULL,
+    FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE,
+    UNIQUE(tenant_id, repo_id, session_id)
+);
+
+CREATE TABLE IF NOT EXISTS context_window_edges (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL DEFAULT 'local-default',
+    source_window_id TEXT NOT NULL,
+    target_window_id TEXT NOT NULL,
+    edge_type TEXT NOT NULL CHECK(edge_type IN (
+        'entity_overlap',
+        'supersedes',
+        'temporal_sequence',
+        'continuation',
+        'shared_scope'
+    )),
+    shared_entities TEXT DEFAULT '[]',
+    weight REAL DEFAULT 1.0,
+    metadata TEXT DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (source_window_id) REFERENCES context_windows(id) ON DELETE CASCADE,
+    FOREIGN KEY (target_window_id) REFERENCES context_windows(id) ON DELETE CASCADE,
+    UNIQUE(tenant_id, source_window_id, target_window_id, edge_type, shared_entities)
 );
 
 CREATE TABLE IF NOT EXISTS edges (
@@ -321,6 +368,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(node_type);
 CREATE INDEX IF NOT EXISTS idx_nodes_created ON nodes(created_at);
 CREATE INDEX IF NOT EXISTS idx_nodes_tenant_type ON nodes(tenant_id, node_type);
 CREATE INDEX IF NOT EXISTS idx_nodes_tenant_updated ON nodes(tenant_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_nodes_context_window ON nodes(context_window_id);
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_edges_relationship ON edges(relationship);
@@ -329,6 +377,13 @@ CREATE INDEX IF NOT EXISTS idx_transcripts_tenant_observed ON transcript_records
 CREATE INDEX IF NOT EXISTS idx_transcripts_tenant_session_turn ON transcript_records(tenant_id, session_id, turn_index);
 CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+CREATE INDEX IF NOT EXISTS idx_repos_tenant_name ON repos(tenant_id, name);
+CREATE INDEX IF NOT EXISTS idx_context_windows_repo ON context_windows(repo_id);
+CREATE INDEX IF NOT EXISTS idx_context_windows_session ON context_windows(session_id);
+CREATE INDEX IF NOT EXISTS idx_context_windows_status ON context_windows(status);
+CREATE INDEX IF NOT EXISTS idx_cw_edges_source ON context_window_edges(source_window_id);
+CREATE INDEX IF NOT EXISTS idx_cw_edges_target ON context_window_edges(target_window_id);
+CREATE INDEX IF NOT EXISTS idx_cw_edges_type ON context_window_edges(edge_type);
 """
 
 RELATION_WEIGHTS: dict[str, float] = {
@@ -458,6 +513,8 @@ class MemoryGraph:
         dedup_similarity_threshold: float = 0.97,
         dedup_same_label_threshold: float = 0.9,
         recency_half_life_days: float = 30.0,
+        tiered_retrieval: bool = False,
+        tiered_retrieval_top_k_windows: int = 3,
         export_dir: str | Path | None = None,
     ) -> None:
         self.db_path = Path(db_path).expanduser()
@@ -466,6 +523,8 @@ class MemoryGraph:
         self.dedup_similarity_threshold = dedup_similarity_threshold
         self.dedup_same_label_threshold = dedup_same_label_threshold
         self.recency_half_life_days = recency_half_life_days
+        self.tiered_retrieval = tiered_retrieval
+        self.tiered_retrieval_top_k_windows = max(1, tiered_retrieval_top_k_windows)
         self.export_dir = Path(export_dir).expanduser() if export_dir is not None else self.db_path.parent / "exports"
         self._lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -475,6 +534,7 @@ class MemoryGraph:
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
         return connection
 
     def _initialize_database(self) -> None:
@@ -499,6 +559,8 @@ class MemoryGraph:
         clone.dedup_similarity_threshold = self.dedup_similarity_threshold
         clone.dedup_same_label_threshold = self.dedup_same_label_threshold
         clone.recency_half_life_days = self.recency_half_life_days
+        clone.tiered_retrieval = self.tiered_retrieval
+        clone.tiered_retrieval_top_k_windows = self.tiered_retrieval_top_k_windows
         clone.export_dir = self.export_dir
         clone._lock = self._lock
         clone.ensure_tenant(clone.tenant_id)
@@ -637,6 +699,9 @@ class MemoryGraph:
             connection.execute("ALTER TABLE nodes ADD COLUMN project TEXT DEFAULT ''")
         if "session_id" not in node_columns:
             connection.execute("ALTER TABLE nodes ADD COLUMN session_id TEXT DEFAULT ''")
+        if "context_window_id" not in node_columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN context_window_id TEXT DEFAULT NULL")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_nodes_context_window ON nodes(context_window_id)")
         if "tenant_id" not in edge_columns:
             connection.execute(
                 f"ALTER TABLE edges ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '{self.tenant_id}'"
@@ -666,6 +731,468 @@ class MemoryGraph:
             (SCHEMA_VERSION, utc_now().isoformat()),
         )
 
+    def ensure_repo(self, project: str = "") -> str:
+        name = project.strip() or "default"
+        repo_id = f"{self.tenant_id}:{slugify(name)}"
+        now = utc_now().isoformat()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO repos (id, tenant_id, name, description, created_at, updated_at)
+                VALUES (?, ?, ?, '', ?, ?)
+                ON CONFLICT(tenant_id, name) DO UPDATE SET updated_at = excluded.updated_at
+                """,
+                (repo_id, self.tenant_id, name, now, now),
+            )
+            row = connection.execute(
+                "SELECT id FROM repos WHERE tenant_id = ? AND name = ?",
+                (self.tenant_id, name),
+            ).fetchone()
+        return str(row["id"])
+
+    def ensure_context_window(self, session_id: str = "", repo_id: str | None = None) -> str:
+        normalized_session = session_id.strip() or "default"
+        resolved_repo_id = repo_id or self.ensure_repo("default")
+        window_id = f"{resolved_repo_id}:{slugify(normalized_session)}"
+        now = utc_now().isoformat()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO context_windows (
+                    id, tenant_id, repo_id, session_id, title, status, node_count,
+                    embedding_stale, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, '', 'active', 0, 1, ?, ?)
+                ON CONFLICT(tenant_id, repo_id, session_id) DO UPDATE SET updated_at = excluded.updated_at
+                """,
+                (window_id, self.tenant_id, resolved_repo_id, normalized_session, now, now),
+            )
+            row = connection.execute(
+                """
+                SELECT id FROM context_windows
+                WHERE tenant_id = ? AND repo_id = ? AND session_id = ?
+                """,
+                (self.tenant_id, resolved_repo_id, normalized_session),
+            ).fetchone()
+        return str(row["id"])
+
+    def resolve_window_context(self, project: str | None = None, session_id: str | None = None) -> tuple[str, str]:
+        repo_id = self.ensure_repo(project or "default")
+        window_id = self.ensure_context_window(session_id or "default", repo_id)
+        return repo_id, window_id
+
+    def update_window_node_count(self, window_id: str) -> int:
+        with self._lock, self._connect() as connection:
+            count = self._update_window_node_count(connection, window_id)
+        return count
+
+    def mark_window_embedding_stale(self, window_id: str) -> None:
+        with self._lock, self._connect() as connection:
+            self._mark_window_embedding_stale(connection, window_id)
+
+    def _update_window_node_count(self, connection: sqlite3.Connection, window_id: str) -> int:
+        count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM nodes WHERE tenant_id = ? AND context_window_id = ?",
+                (self.tenant_id, window_id),
+            ).fetchone()[0]
+        )
+        connection.execute(
+            """
+            UPDATE context_windows
+            SET node_count = ?, updated_at = ?
+            WHERE tenant_id = ? AND id = ?
+            """,
+            (count, utc_now().isoformat(), self.tenant_id, window_id),
+        )
+        return count
+
+    def _mark_window_embedding_stale(self, connection: sqlite3.Connection, window_id: str) -> None:
+        connection.execute(
+            """
+            UPDATE context_windows
+            SET embedding_stale = 1, updated_at = ?
+            WHERE tenant_id = ? AND id = ?
+            """,
+            (utc_now().isoformat(), self.tenant_id, window_id),
+        )
+
+    def get_context_window(self, window_id: str) -> ContextWindow:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, tenant_id, repo_id, session_id, title, status, node_count,
+                       embedding_stale, created_at, updated_at, closed_at
+                FROM context_windows
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (self.tenant_id, window_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"Context window not found: {window_id}")
+        return self._row_to_context_window(row)
+
+    def list_context_windows(
+        self,
+        *,
+        project: str = "",
+        status: str = "",
+        limit: int = 20,
+    ) -> list[ContextWindow]:
+        if limit < 1:
+            raise ValueError("limit must be at least 1.")
+        normalized_status = status.strip().lower()
+        if normalized_status and normalized_status not in {"active", "closed", "archived"}:
+            raise ValueError("status must be one of: active, closed, archived.")
+
+        query = """
+            SELECT cw.id, cw.tenant_id, cw.repo_id, cw.session_id, cw.title, cw.status, cw.node_count,
+                   cw.embedding_stale, cw.created_at, cw.updated_at, cw.closed_at
+            FROM context_windows cw
+            JOIN repos r ON r.id = cw.repo_id
+            WHERE cw.tenant_id = ?
+        """
+        params: list[Any] = [self.tenant_id]
+        if project.strip():
+            query += " AND r.name = ?"
+            params.append(project.strip())
+        if normalized_status:
+            query += " AND cw.status = ?"
+            params.append(normalized_status)
+        query += " ORDER BY cw.updated_at DESC LIMIT ?"
+        params.append(limit)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [self._row_to_context_window(row) for row in rows]
+
+    def get_context_window_edges(self, window_id: str) -> list[ContextWindowEdge]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, tenant_id, source_window_id, target_window_id, edge_type,
+                       shared_entities, weight, metadata, created_at
+                FROM context_window_edges
+                WHERE tenant_id = ?
+                  AND (source_window_id = ? OR target_window_id = ?)
+                ORDER BY created_at DESC
+                """,
+                (self.tenant_id, window_id, window_id),
+            ).fetchall()
+        return [self._row_to_context_window_edge(row) for row in rows]
+
+    def close_context_window(self, window_id: str) -> ContextWindow:
+        embedding = self.compute_window_embedding(window_id)
+        with self._lock, self._connect() as connection:
+            if embedding is not None:
+                self._save_window_embedding(connection, window_id, embedding)
+            self._update_window_node_count(connection, window_id)
+            now = utc_now().isoformat()
+            connection.execute(
+                """
+                UPDATE context_windows
+                SET status = 'closed', closed_at = COALESCE(closed_at, ?), updated_at = ?
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (now, now, self.tenant_id, window_id),
+            )
+            row = connection.execute(
+                """
+                SELECT id, tenant_id, repo_id, session_id, title, status, node_count,
+                       embedding_stale, created_at, updated_at, closed_at
+                FROM context_windows
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (self.tenant_id, window_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"Context window not found: {window_id}")
+        window = self._row_to_context_window(row)
+        self.derive_context_window_edges(window.id, window.repo_id)
+        return window
+
+    def get_nodes_without_window(self) -> list[Node]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type,
+                       tags, source_prompt, metadata, evidence_records, valid_from, valid_to,
+                       created_at, updated_at, access_count, tenant_id
+                FROM nodes
+                WHERE tenant_id = ? AND context_window_id IS NULL
+                ORDER BY updated_at ASC
+                """,
+                (self.tenant_id,),
+            ).fetchall()
+        return [self._row_to_node(row) for row in rows]
+
+    def assign_nodes_to_window(self, node_ids: list[str], window_id: str) -> int:
+        if not node_ids:
+            return 0
+        placeholders = ", ".join("?" for _ in node_ids)
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE nodes
+                SET context_window_id = ?
+                WHERE tenant_id = ? AND context_window_id IS NULL AND id IN ({placeholders})
+                """,
+                (window_id, self.tenant_id, *node_ids),
+            )
+            updated = int(cursor.rowcount or 0)
+            self._update_window_node_count(connection, window_id)
+            self._mark_window_embedding_stale(connection, window_id)
+        return updated
+
+    def list_repos(self) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, tenant_id, name, description, created_at, updated_at
+                FROM repos
+                WHERE tenant_id = ?
+                ORDER BY updated_at DESC
+                """,
+                (self.tenant_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_repo_windows(
+        self,
+        repo_id: str,
+        *,
+        exclude: str | None = None,
+        include_archived: bool = False,
+    ) -> list[ContextWindow]:
+        query = """
+            SELECT id, tenant_id, repo_id, session_id, title, status, node_count,
+                   embedding_stale, created_at, updated_at, closed_at
+            FROM context_windows
+            WHERE tenant_id = ? AND repo_id = ?
+        """
+        params: list[Any] = [self.tenant_id, repo_id]
+        if exclude:
+            query += " AND id != ?"
+            params.append(exclude)
+        if not include_archived:
+            query += " AND status != 'archived'"
+        query += " ORDER BY updated_at DESC"
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [self._row_to_context_window(row) for row in rows]
+
+    def get_window_nodes(self, window_id: str, node_types: list[NodeType] | None = None) -> list[Node]:
+        query = """
+            SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type,
+                   tags, source_prompt, metadata, evidence_records, valid_from, valid_to,
+                   created_at, updated_at, access_count, tenant_id
+            FROM nodes
+            WHERE tenant_id = ? AND context_window_id = ?
+        """
+        params: list[Any] = [self.tenant_id, window_id]
+        if node_types:
+            placeholders = ", ".join("?" for _ in node_types)
+            query += f" AND node_type IN ({placeholders})"
+            params.extend(node_type.value for node_type in node_types)
+        query += " ORDER BY updated_at DESC"
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [self._row_to_node(row) for row in rows]
+
+    def compute_window_embedding(self, window_id: str) -> np.ndarray | None:
+        meaningful_types = [
+            NodeType.DECISION,
+            NodeType.FACT,
+            NodeType.ENTITY,
+            NodeType.PREFERENCE,
+            NodeType.CONCEPT,
+        ]
+        nodes = self.get_window_nodes(window_id, node_types=meaningful_types)
+        if not nodes:
+            return None
+
+        type_rank = {
+            NodeType.DECISION: 0,
+            NodeType.FACT: 1,
+            NodeType.ENTITY: 2,
+            NodeType.PREFERENCE: 3,
+            NodeType.CONCEPT: 4,
+        }
+        nodes.sort(key=lambda node: (type_rank.get(node.node_type, 99), -node.updated_at.timestamp(), node.label.lower()))
+        if len(nodes) > 100:
+            LOGGER.warning("context_window_embedding_truncated", extra={"window_id": window_id, "node_count": len(nodes)})
+            nodes = nodes[:100]
+        window_text = " | ".join(f"{node.label}: {node.content}" for node in nodes)
+        if not window_text.strip():
+            return None
+        return self.embedding_model.embed(window_text[:12000])
+
+    def get_window_embedding(self, window_id: str) -> np.ndarray | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT embedding, embedding_stale
+                FROM context_windows
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (self.tenant_id, window_id),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["embedding"] is not None and not bool(row["embedding_stale"]):
+                return self.embedding_model.from_bytes(row["embedding"])
+
+        embedding = self.compute_window_embedding(window_id)
+        if embedding is None:
+            return None
+        with self._lock, self._connect() as connection:
+            self._save_window_embedding(connection, window_id, embedding)
+        return embedding
+
+    def _save_window_embedding(self, connection: sqlite3.Connection, window_id: str, embedding: np.ndarray) -> None:
+        connection.execute(
+            """
+            UPDATE context_windows
+            SET embedding = ?, embedding_stale = 0, updated_at = ?
+            WHERE tenant_id = ? AND id = ?
+            """,
+            (self.embedding_model.to_bytes(embedding), utc_now().isoformat(), self.tenant_id, window_id),
+        )
+
+    def extract_window_entities(self, window_id: str) -> list[dict[str, str]]:
+        nodes = self.get_window_nodes(
+            window_id,
+            node_types=[NodeType.ENTITY, NodeType.FACT, NodeType.DECISION, NodeType.PREFERENCE],
+        )
+        return [
+            {
+                "label": node.label,
+                "node_type": node.node_type.value,
+                "content": node.content,
+            }
+            for node in nodes
+        ]
+
+    def create_context_window_edge(
+        self,
+        *,
+        source_window_id: str,
+        target_window_id: str,
+        edge_type: str,
+        shared_entities: list[str] | None = None,
+        weight: float = 1.0,
+        metadata: dict[str, Any] | None = None,
+    ) -> ContextWindowEdge:
+        entities = sorted({entity.strip().lower() for entity in (shared_entities or []) if entity.strip()})
+        edge = ContextWindowEdge(
+            tenant_id=self.tenant_id,
+            source_window_id=source_window_id,
+            target_window_id=target_window_id,
+            edge_type=edge_type,
+            shared_entities=entities,
+            weight=max(0.0, min(1.0, weight)),
+            metadata=metadata or {},
+        )
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO context_window_edges (
+                    id, tenant_id, source_window_id, target_window_id, edge_type,
+                    shared_entities, weight, metadata, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id, source_window_id, target_window_id, edge_type, shared_entities)
+                DO UPDATE SET weight = MAX(context_window_edges.weight, excluded.weight),
+                              metadata = excluded.metadata
+                """,
+                (
+                    edge.id,
+                    edge.tenant_id,
+                    edge.source_window_id,
+                    edge.target_window_id,
+                    edge.edge_type,
+                    json.dumps(edge.shared_entities, sort_keys=True),
+                    edge.weight,
+                    _encode_metadata(edge.metadata),
+                    edge.created_at.isoformat(),
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT id, tenant_id, source_window_id, target_window_id, edge_type,
+                       shared_entities, weight, metadata, created_at
+                FROM context_window_edges
+                WHERE tenant_id = ? AND source_window_id = ? AND target_window_id = ?
+                  AND edge_type = ? AND shared_entities = ?
+                """,
+                (
+                    self.tenant_id,
+                    source_window_id,
+                    target_window_id,
+                    edge_type,
+                    json.dumps(edge.shared_entities, sort_keys=True),
+                ),
+            ).fetchone()
+        return self._row_to_context_window_edge(row)
+
+    def derive_context_window_edges(self, window_id: str, repo_id: str) -> list[ContextWindowEdge]:
+        current_entities = self.extract_window_entities(window_id)
+        if not current_entities:
+            return []
+
+        current_by_label = {entity["label"].strip().lower(): entity for entity in current_entities if entity["label"].strip()}
+        if not current_by_label:
+            return []
+
+        created_edges: list[ContextWindowEdge] = []
+        other_windows = self.get_repo_windows(repo_id, exclude=window_id)
+        if len(other_windows) > 200:
+            other_windows = other_windows[:200]
+
+        for other_window in other_windows:
+            other_entities = self.extract_window_entities(other_window.id)
+            other_by_label = {entity["label"].strip().lower(): entity for entity in other_entities if entity["label"].strip()}
+            overlap = set(current_by_label) & set(other_by_label)
+            if not overlap:
+                continue
+
+            has_conflict = any(
+                normalize_text(current_by_label[label]["content"]) != normalize_text(other_by_label[label]["content"])
+                for label in overlap
+            )
+            edge_type = "supersedes" if has_conflict else "entity_overlap"
+            denominator = max(len(current_by_label), len(other_by_label), 1)
+            created_edges.append(
+                self.create_context_window_edge(
+                    source_window_id=other_window.id,
+                    target_window_id=window_id,
+                    edge_type=edge_type,
+                    shared_entities=sorted(overlap),
+                    weight=len(overlap) / denominator,
+                )
+            )
+
+        previous_window = next(iter(other_windows), None)
+        if previous_window is not None:
+            created_edges.append(
+                self.create_context_window_edge(
+                    source_window_id=previous_window.id,
+                    target_window_id=window_id,
+                    edge_type="temporal_sequence",
+                    shared_entities=[],
+                    weight=1.0,
+                )
+            )
+
+        LOGGER.info(
+            "window_edges_derived",
+            extra={
+                "window_id": window_id,
+                "repo_id": repo_id,
+                "edges_created": len(created_edges),
+            },
+        )
+        return created_edges
+
     def add_node(
         self,
         *,
@@ -681,11 +1208,13 @@ class MemoryGraph:
         valid_from: datetime | None = None,
         valid_to: datetime | None = None,
     ) -> NodeStoreResult:
+        _, context_window_id = self.resolve_window_context(project=project, session_id=session_id)
         node = Node(
             tenant_id=self.tenant_id,
             agent_id=agent_id,
             project=project,
             session_id=session_id,
+            context_window_id=context_window_id,
             label=label,
             content=content,
             node_type=node_type,
@@ -707,6 +1236,16 @@ class MemoryGraph:
                     existing_node=existing_node,
                     incoming_node=node,
                 )
+                if merged_node.context_window_id:
+                    connection.execute(
+                        """
+                        UPDATE nodes
+                        SET context_window_id = COALESCE(context_window_id, ?)
+                        WHERE tenant_id = ? AND id = ?
+                        """,
+                        (merged_node.context_window_id, self.tenant_id, merged_node.id),
+                    )
+                    self._mark_window_embedding_stale(connection, merged_node.context_window_id)
                 return NodeStoreResult(
                     node=merged_node,
                     created=False,
@@ -717,11 +1256,12 @@ class MemoryGraph:
             connection.execute(
                 """
                 INSERT INTO nodes (
-                    id, tenant_id, agent_id, project, session_id, label, content, node_type, tags, metadata, embedding,
+                    id, tenant_id, agent_id, project, session_id, context_window_id,
+                    label, content, node_type, tags, metadata, embedding,
                     source_prompt, evidence_records, valid_from, valid_to,
                     created_at, updated_at, access_count
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     node.id,
@@ -729,6 +1269,7 @@ class MemoryGraph:
                     node.agent_id,
                     node.project,
                     node.session_id,
+                    node.context_window_id,
                     node.label,
                     node.content,
                     node.node_type.value,
@@ -744,6 +1285,8 @@ class MemoryGraph:
                     node.access_count,
                 ),
             )
+            self._mark_window_embedding_stale(connection, context_window_id)
+            self._update_window_node_count(connection, context_window_id)
             conflicts = self._register_conflicts(connection, node)
         return NodeStoreResult(node=node, created=True, conflicts=conflicts)
 
@@ -970,15 +1513,23 @@ class MemoryGraph:
             raise ValueError("retrieval_mode must be one of: graph, replay, fusion.")
 
         graph_result = (
-            self._query_graph_only(
+            self.tiered_query(
                 query=query_text,
+                project=project,
                 max_nodes=max_nodes,
                 max_depth=max_depth,
-                expand_depth=expand_depth,
-                agent_id=agent_id,
-                project=project,
-                session_id=session_id,
+                top_k_windows=self.tiered_retrieval_top_k_windows,
             )
+            if self.tiered_retrieval and project.strip()
+            else self._query_graph_only(
+                    query=query_text,
+                    max_nodes=max_nodes,
+                    max_depth=max_depth,
+                    expand_depth=expand_depth,
+                    agent_id=agent_id,
+                    project=project,
+                    session_id=session_id,
+                )
             if normalized_mode in {"graph", "fusion"}
             else None
         )
@@ -994,7 +1545,8 @@ class MemoryGraph:
             else []
         )
         if normalized_mode == "graph":
-            graph_result.retrieval_mode = "graph"
+            if graph_result.retrieval_mode not in {"tiered", "flat_fallback"}:
+                graph_result.retrieval_mode = "graph"
             return graph_result
         if normalized_mode == "replay":
             return SubgraphResult(
@@ -1014,6 +1566,283 @@ class MemoryGraph:
             total_nodes_in_graph=graph_result.total_nodes_in_graph if graph_result is not None else 0,
         )
 
+    def tiered_query(
+        self,
+        *,
+        query: str,
+        project: str = "",
+        repo_id: str | None = None,
+        max_nodes: int = 20,
+        max_depth: int = 2,
+        top_k_windows: int | None = None,
+    ) -> SubgraphResult:
+        query_text = query.strip()
+        if not query_text:
+            raise ValueError("Query cannot be empty.")
+        if max_nodes < 1:
+            raise ValueError("max_nodes must be at least 1.")
+        if max_depth < 0:
+            raise ValueError("max_depth cannot be negative.")
+
+        resolved_repo_id = repo_id or self.ensure_repo(project or "default")
+        query_embedding = self.embedding_model.embed(self._expand_query_aliases(query_text))
+        windows = self.get_repo_windows(resolved_repo_id)
+        now = time.time()
+        replay_session_scores = self._query_replay_session_scores(
+            query=query_text,
+            query_embedding=query_embedding,
+            agent_id="",
+            project=project,
+            session_id="",
+        )
+        window_scores: list[tuple[float, ContextWindow]] = []
+        for window in windows:
+            window_embedding = self.get_window_embedding(window.id)
+            if window_embedding is None:
+                continue
+            similarity = max(self.embedding_model.cosine_similarity(query_embedding, window_embedding), 0.0)
+            similarity = self._blend_session_signal(
+                base_similarity=similarity,
+                session_signal=replay_session_scores.get(window.session_id, 0.0),
+            )
+            recency = recency_weight(
+                window.updated_at.timestamp(),
+                now=now,
+                half_life_days=self.recency_half_life_days,
+            )
+            window_scores.append(((0.6 * similarity) + (0.4 * recency), window))
+
+        if not window_scores:
+            fallback = self._query_graph_only(
+                query=query_text,
+                max_nodes=max_nodes,
+                max_depth=max_depth,
+                expand_depth=0,
+                agent_id="",
+                project=project,
+                session_id="",
+            )
+            fallback.retrieval_mode = "flat_fallback"
+            return fallback
+
+        window_scores.sort(key=lambda item: (item[0], item[1].updated_at.timestamp()), reverse=True)
+        selected_windows = [window for _, window in window_scores[: max(1, top_k_windows or self.tiered_retrieval_top_k_windows)]]
+        selected_window_ids = {window.id for window in selected_windows}
+
+        with self._lock, self._connect() as connection:
+            candidate_rows = connection.execute(
+                """
+                SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type,
+                       tags, source_prompt, metadata, evidence_records, valid_from, valid_to,
+                       created_at, updated_at, access_count, embedding, tenant_id
+                FROM nodes
+                WHERE tenant_id = ? AND context_window_id IN ({})
+                  AND embedding IS NOT NULL
+                """.format(", ".join("?" for _ in selected_window_ids)),
+                (self.tenant_id, *selected_window_ids),
+            ).fetchall()
+            total_nodes = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM nodes WHERE tenant_id = ?",
+                    (self.tenant_id,),
+                ).fetchone()[0]
+            )
+
+            if not candidate_rows:
+                fallback = self._query_graph_only(
+                    query=query_text,
+                    max_nodes=max_nodes,
+                    max_depth=max_depth,
+                    expand_depth=0,
+                    agent_id="",
+                    project=project,
+                    session_id="",
+                )
+                fallback.retrieval_mode = "flat_fallback"
+                return fallback
+
+            candidates: list[Node] = []
+            similarity_by_id: dict[str, float] = {}
+            for row in candidate_rows:
+                node = self._row_to_node(row)
+                semantic = max(
+                    self.embedding_model.cosine_similarity(query_embedding, self.embedding_model.from_bytes(row["embedding"])),
+                    0.0,
+                )
+                lexical = self._lexical_score_for_node(query_text, node)
+                similarity = max(0.0, min(1.0, (0.8 * semantic) + (0.2 * lexical)))
+                similarity = self._blend_session_signal(
+                    base_similarity=similarity,
+                    session_signal=replay_session_scores.get(node.session_id, 0.0),
+                )
+                candidates.append(node)
+                similarity_by_id[node.id] = similarity
+
+            candidate_ids = [node.id for node in candidates]
+            edges = self._fetch_edges_for_nodes(connection, candidate_ids)
+            scored_nodes = [
+                self._apply_node_score(
+                    node,
+                    similarity=similarity_by_id.get(node.id, 0.0),
+                    edge_weight=self._strongest_edge_weight(node.id, edges),
+                    now=now,
+                )
+                for node in candidates
+            ]
+            scored_nodes.sort(
+                key=lambda node: (
+                    node.final_score if node.final_score is not None else 0.0,
+                    node.updated_at.timestamp(),
+                    node.label.lower(),
+                ),
+                reverse=True,
+            )
+            selected_nodes = scored_nodes[:max_nodes]
+            selected_ids = [node.id for node in selected_nodes]
+            selected_edges = self._fetch_edges_for_nodes(connection, selected_ids)
+            self._increment_access_counts(connection, selected_ids)
+            for node in selected_nodes:
+                node.access_count += 1
+
+        return SubgraphResult(
+            nodes=selected_nodes,
+            edges=selected_edges,
+            retrieval_mode="tiered",
+            query=query_text,
+            total_nodes_in_graph=total_nodes,
+        )
+
+    def debug_retrieval(
+        self,
+        *,
+        query: str,
+        project: str = "",
+        agent_id: str = "",
+        session_id: str = "",
+        max_nodes: int = 10,
+        max_depth: int = 2,
+    ) -> dict[str, Any]:
+        query_text = query.strip()
+        if not query_text:
+            raise ValueError("Query cannot be empty.")
+        if max_nodes < 1:
+            raise ValueError("max_nodes must be at least 1.")
+        if max_depth < 0:
+            raise ValueError("max_depth cannot be negative.")
+
+        expanded_query = self._expand_query_aliases(query_text)
+        query_embedding = self.embedding_model.embed(expanded_query)
+        repo_id = self.ensure_repo(project or "default")
+        now = time.time()
+
+        replay_session_scores = self._query_replay_session_scores(
+            query=expanded_query,
+            query_embedding=query_embedding,
+            agent_id=agent_id,
+            project=project,
+            session_id=session_id,
+        )
+        windows = self.get_repo_windows(repo_id)
+        window_details: list[dict[str, Any]] = []
+        for window in windows:
+            recency = recency_weight(
+                window.updated_at.timestamp(),
+                now=now,
+                half_life_days=self.recency_half_life_days,
+            )
+            detail: dict[str, Any] = {
+                "window_id": window.id,
+                "repo_id": window.repo_id,
+                "session_id": window.session_id,
+                "title": window.title,
+                "status": window.status,
+                "node_count": window.node_count,
+                "embedding": "missing",
+                "embedding_stale": window.embedding_stale,
+                "similarity": None,
+                "recency": round(float(recency), 4),
+                "routing_score": None,
+                "updated_at": window.updated_at.isoformat(),
+            }
+            window_embedding = self.get_window_embedding(window.id)
+            if window_embedding is not None:
+                similarity = max(self.embedding_model.cosine_similarity(query_embedding, window_embedding), 0.0)
+                similarity = self._blend_session_signal(
+                    base_similarity=similarity,
+                    session_signal=replay_session_scores.get(window.session_id, 0.0),
+                )
+                routing_score = (0.6 * similarity) + (0.4 * recency)
+                detail.update(
+                    {
+                        "embedding": "ok",
+                        "similarity": round(float(similarity), 4),
+                        "routing_score": round(float(routing_score), 4),
+                    }
+                )
+            window_details.append(detail)
+
+        window_details.sort(
+            key=lambda item: (
+                item["routing_score"] if item["routing_score"] is not None else -1.0,
+                item["updated_at"],
+            ),
+            reverse=True,
+        )
+
+        flat_result = self._query_graph_only(
+            query=query_text,
+            max_nodes=max_nodes,
+            max_depth=max_depth,
+            expand_depth=0,
+            agent_id=agent_id,
+            project=project,
+            session_id=session_id,
+        )
+        tiered_result = self.tiered_query(
+            query=query_text,
+            project=project,
+            repo_id=repo_id,
+            max_nodes=max_nodes,
+            max_depth=max_depth,
+            top_k_windows=self.tiered_retrieval_top_k_windows,
+        )
+
+        def summarize_node(node: Node) -> dict[str, Any]:
+            return {
+                "node_id": node.id,
+                "label": node.label,
+                "node_type": node.node_type.value,
+                "project": node.project,
+                "session_id": node.session_id,
+                "context_window_id": node.context_window_id,
+                "similarity_score": node.similarity_score,
+                "recency_score": node.recency_score,
+                "edge_score": node.edge_score,
+                "final_score": node.final_score,
+                "updated_at": node.updated_at.isoformat(),
+            }
+
+        return {
+            "query": query_text,
+            "expanded_query": expanded_query,
+            "repo_id": repo_id,
+            "project": project,
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "retrieval_mode": "tiered" if self.tiered_retrieval else "flat",
+            "embedding_preview": [round(float(value), 6) for value in query_embedding[:5]],
+            "windows_evaluated": len(window_details),
+            "all_windows": window_details,
+            "selected_windows": [
+                window
+                for window in window_details
+                if window["routing_score"] is not None
+            ][: max(1, self.tiered_retrieval_top_k_windows)],
+            "flat_top_nodes": [summarize_node(node) for node in flat_result.nodes[:max_nodes]],
+            "tiered_top_nodes": [summarize_node(node) for node in tiered_result.nodes[:max_nodes]],
+            "tiered_result_mode": tiered_result.retrieval_mode,
+        }
+
     def _query_graph_only(
         self,
         *,
@@ -1029,8 +1858,9 @@ class MemoryGraph:
             temporal_hints = infer_temporal_hints(query)
             node_rows = connection.execute(
                 """
-                SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt, metadata,
-                       evidence_records, valid_from, valid_to, created_at, updated_at, access_count, embedding, tenant_id
+                SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags,
+                       source_prompt, metadata, evidence_records, valid_from, valid_to, created_at,
+                       updated_at, access_count, embedding, tenant_id
                 FROM nodes
                 WHERE tenant_id = ? AND embedding IS NOT NULL
                 """,
@@ -1066,6 +1896,20 @@ class MemoryGraph:
             similarity_by_id = {
                 node_id: max(self.embedding_model.cosine_similarity(query_embedding, embedding), 0.0)
                 for node_id, embedding in embeddings_by_id.items()
+            }
+            replay_session_scores = self._query_replay_session_scores(
+                query=expanded_query,
+                query_embedding=query_embedding,
+                agent_id=agent_id,
+                project=project,
+                session_id=active_session_id,
+            )
+            similarity_by_id = {
+                node_id: self._blend_session_signal(
+                    base_similarity=similarity,
+                    session_signal=replay_session_scores.get(nodes_by_id[node_id].session_id, 0.0),
+                )
+                for node_id, similarity in similarity_by_id.items()
             }
             lexical_by_id = {
                 node_id: self._lexical_score_for_node(expanded_query, node)
@@ -1253,6 +2097,119 @@ class MemoryGraph:
         )
         hits = build_hits(active_session_id)
         return [item[1] for item in sorted(hits, key=lambda item: (-item[0], -item[1].observed_at.timestamp(), item[1].turn_index))[:max_hits]]
+
+    def _query_replay_session_scores(
+        self,
+        *,
+        query: str,
+        query_embedding: np.ndarray | None = None,
+        agent_id: str,
+        project: str,
+        session_id: str,
+    ) -> dict[str, float]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, tenant_id, agent_id, project, session_id, observed_at, turn_index, role, transcript_text, embedding, metadata
+                FROM transcript_records
+                WHERE tenant_id = ? AND embedding IS NOT NULL
+                ORDER BY observed_at DESC, turn_index DESC
+                """,
+                (self.tenant_id,),
+            ).fetchall()
+        if not rows:
+            return {}
+
+        query_vector = query_embedding if query_embedding is not None else self.embedding_model.embed(query)
+        active_session_id = _retrieval_session_scope(
+            agent_id=agent_id,
+            project=project,
+            session_id=session_id,
+        )
+        scores_by_session: dict[str, float] = {}
+        for row in rows:
+            record = self._row_to_transcript_record(row)
+            if not self._transcript_scope_matches(record, agent_id=agent_id, project=project, session_id=active_session_id):
+                continue
+            scoped_session_id = record.session_id.strip()
+            if not scoped_session_id:
+                continue
+            embedding = self.embedding_model.from_bytes(row["embedding"])
+            semantic_score = max(self.embedding_model.cosine_similarity(query_vector, embedding), 0.0)
+            lexical_score = lexical_overlap(query, record.role, record.transcript_text)
+            role_score = 1.0 if record.role == "user" else 0.8
+            score = max(0.0, min(1.0, (0.65 * semantic_score) + (0.25 * lexical_score) + (0.10 * role_score)))
+            previous = scores_by_session.get(scoped_session_id, 0.0)
+            if score > previous:
+                scores_by_session[scoped_session_id] = score
+        return scores_by_session
+
+    def _recent_transcript_session_scores(
+        self,
+        *,
+        agent_id: str,
+        project: str,
+        session_id: str,
+    ) -> dict[str, float]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, tenant_id, agent_id, project, session_id, observed_at, turn_index, role, transcript_text, metadata
+                FROM transcript_records
+                WHERE tenant_id = ?
+                ORDER BY observed_at DESC, turn_index DESC
+                """,
+                (self.tenant_id,),
+            ).fetchall()
+        if not rows:
+            return {}
+
+        active_session_id = _retrieval_session_scope(
+            agent_id=agent_id,
+            project=project,
+            session_id=session_id,
+        )
+        timestamps = [
+            self._row_to_transcript_record(row).observed_at.timestamp()
+            for row in rows
+            if self._transcript_scope_matches(
+                self._row_to_transcript_record(row),
+                agent_id=agent_id,
+                project=project,
+                session_id=active_session_id,
+            )
+        ]
+        if not timestamps:
+            return {}
+        now = max(timestamps)
+        scores_by_session: dict[str, float] = {}
+        for row in rows:
+            record = self._row_to_transcript_record(row)
+            if not self._transcript_scope_matches(record, agent_id=agent_id, project=project, session_id=active_session_id):
+                continue
+            scoped_session_id = record.session_id.strip()
+            if not scoped_session_id:
+                continue
+            score = recency_weight(
+                record.observed_at.timestamp(),
+                now=now,
+                half_life_days=self.recency_half_life_days,
+            )
+            previous = scores_by_session.get(scoped_session_id, 0.0)
+            if score > previous:
+                scores_by_session[scoped_session_id] = score
+        return scores_by_session
+
+    def _blend_session_signal(
+        self,
+        *,
+        base_similarity: float,
+        session_signal: float,
+        session_weight: float = 0.25,
+    ) -> float:
+        base = max(0.0, min(1.0, base_similarity))
+        session = max(0.0, min(1.0, session_signal))
+        return max(0.0, min(1.0, ((1.0 - session_weight) * base) + (session_weight * session)))
 
     def _build_fusion_hits(self, graph_result: SubgraphResult, replay_hits: list[ReplayHit]) -> list[FusionHit]:
         rrf_k = 60.0
@@ -1525,6 +2482,27 @@ class MemoryGraph:
             total_edges = int(
                 connection.execute("SELECT COUNT(*) FROM edges WHERE tenant_id = ?", (self.tenant_id,)).fetchone()[0]
             )
+            total_repos = int(
+                connection.execute("SELECT COUNT(*) FROM repos WHERE tenant_id = ?", (self.tenant_id,)).fetchone()[0]
+            )
+            total_context_windows = int(
+                connection.execute("SELECT COUNT(*) FROM context_windows WHERE tenant_id = ?", (self.tenant_id,)).fetchone()[0]
+            )
+            total_context_window_edges = int(
+                connection.execute("SELECT COUNT(*) FROM context_window_edges WHERE tenant_id = ?", (self.tenant_id,)).fetchone()[0]
+            )
+            windows_with_embeddings = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM context_windows WHERE tenant_id = ? AND embedding IS NOT NULL",
+                    (self.tenant_id,),
+                ).fetchone()[0]
+            )
+            windows_with_stale_embeddings = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM context_windows WHERE tenant_id = ? AND embedding_stale = 1",
+                    (self.tenant_id,),
+                ).fetchone()[0]
+            )
 
             counts = {
                 node_type.value: 0
@@ -1535,6 +2513,20 @@ class MemoryGraph:
                 (self.tenant_id,),
             ).fetchall():
                 counts[str(row["node_type"])] = int(row["count"])
+            window_status_counts = {
+                str(row["status"]): int(row["count"])
+                for row in connection.execute(
+                    "SELECT status, COUNT(*) AS count FROM context_windows WHERE tenant_id = ? GROUP BY status",
+                    (self.tenant_id,),
+                ).fetchall()
+            }
+            window_edge_type_counts = {
+                str(row["edge_type"]): int(row["count"])
+                for row in connection.execute(
+                    "SELECT edge_type, COUNT(*) AS count FROM context_window_edges WHERE tenant_id = ? GROUP BY edge_type",
+                    (self.tenant_id,),
+                ).fetchall()
+            }
 
             most_connected_rows = connection.execute(
                 """
@@ -1563,6 +2555,13 @@ class MemoryGraph:
             return GraphStats(
                 total_nodes=total_nodes,
                 total_edges=total_edges,
+                total_repos=total_repos,
+                total_context_windows=total_context_windows,
+                context_window_status_breakdown=window_status_counts,
+                total_context_window_edges=total_context_window_edges,
+                context_window_edge_type_breakdown=window_edge_type_counts,
+                windows_with_embeddings=windows_with_embeddings,
+                windows_with_stale_embeddings=windows_with_stale_embeddings,
                 node_type_breakdown=counts,
                 most_connected_nodes=[
                     ConnectedNodeStat(
@@ -1675,6 +2674,109 @@ class MemoryGraph:
                 label=edge.relationship,
                 title=f"weight={edge.weight}",
                 value=max(edge.weight, 0.1),
+                arrows="to",
+            )
+
+        destination.write_text(network.generate_html(notebook=False), encoding="utf-8")
+        return destination
+
+    def export_window_graph_html(
+        self,
+        *,
+        project: str = "",
+        output_path: str | Path | None = None,
+        include_physics: bool = True,
+    ) -> Path:
+        try:
+            from pyvis.network import Network
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("pyvis is not installed. Install the project dependencies again.") from exc
+
+        repo_id = self.ensure_repo(project or "default")
+        windows = self.get_repo_windows(repo_id, include_archived=True)
+        window_ids = {window.id for window in windows}
+        with self._lock, self._connect() as connection:
+            edge_rows = connection.execute(
+                """
+                SELECT id, tenant_id, source_window_id, target_window_id, edge_type,
+                       shared_entities, weight, metadata, created_at
+                FROM context_window_edges
+                WHERE tenant_id = ?
+                  AND source_window_id IN ({})
+                  AND target_window_id IN ({})
+                ORDER BY created_at ASC
+                """.format(
+                    ", ".join("?" for _ in window_ids) or "NULL",
+                    ", ".join("?" for _ in window_ids) or "NULL",
+                ),
+                (self.tenant_id, *window_ids, *window_ids),
+            ).fetchall() if window_ids else []
+        edges = [self._row_to_context_window_edge(row) for row in edge_rows]
+
+        if output_path is None:
+            self.export_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = utc_now().strftime("%Y%m%d-%H%M%S")
+            destination = self.export_dir / f"waggle-window-graph-{timestamp}.html"
+        else:
+            destination = Path(output_path).expanduser()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+
+        network = Network(
+            height="800px",
+            width="100%",
+            directed=True,
+            bgcolor="#0f172a",
+            font_color="#e2e8f0",
+        )
+        network.barnes_hut()
+        if not include_physics:
+            network.toggle_physics(False)
+
+        status_colors = {
+            "active": "#34d399",
+            "closed": "#38bdf8",
+            "archived": "#94a3b8",
+        }
+        edge_colors = {
+            "entity_overlap": "#38bdf8",
+            "supersedes": "#fb7185",
+            "temporal_sequence": "#94a3b8",
+            "continuation": "#fbbf24",
+            "shared_scope": "#34d399",
+        }
+
+        for window in windows:
+            connected_edges = [edge for edge in edges if edge.source_window_id == window.id or edge.target_window_id == window.id]
+            label = window.title or window.session_id or window.id
+            title_lines = [
+                f"<b>{label}</b>",
+                f"Window: {window.id}",
+                f"Repo: {window.repo_id}",
+                f"Status: {window.status}",
+                f"Session: {window.session_id}",
+                f"Nodes: {window.node_count}",
+                f"Connected Windows: {len(connected_edges)}",
+                f"Created: {window.created_at.isoformat()}",
+                f"Updated: {window.updated_at.isoformat()}",
+            ]
+            network.add_node(
+                window.id,
+                label=label,
+                title="<br>".join(title_lines),
+                color=status_colors.get(window.status, "#94a3b8"),
+                shape="dot",
+                size=18 + min(max(window.node_count, 0), 50),
+            )
+
+        for edge in edges:
+            shared = ", ".join(edge.shared_entities)
+            network.add_edge(
+                edge.source_window_id,
+                edge.target_window_id,
+                label=edge.edge_type,
+                title=f"weight={edge.weight}" + (f"<br>shared={shared}" if shared else ""),
+                value=max(edge.weight, 0.1),
+                color=edge_colors.get(edge.edge_type, "#94a3b8"),
                 arrows="to",
             )
 
@@ -1997,6 +3099,12 @@ class MemoryGraph:
                 tenant_id=self.tenant_id,
                 schema_version=int(snapshot.get("schema_version", 1)),
             )
+            for raw_repo in snapshot.get("repos", []):
+                self._upsert_snapshot_repo(connection, {**raw_repo, "tenant_id": self.tenant_id})
+
+            for raw_window in snapshot.get("context_windows", []):
+                self._upsert_snapshot_context_window(connection, {**raw_window, "tenant_id": self.tenant_id})
+
             for raw_node in snapshot.get("nodes", []):
                 raw_node = {**raw_node, "tenant_id": raw_node.get("tenant_id") or snapshot_tenant}
                 if raw_node["tenant_id"] != self.tenant_id:
@@ -2018,6 +3126,18 @@ class MemoryGraph:
                 else:
                     self._update_snapshot_edge(connection, raw_edge)
                     result.edges_updated += 1
+
+            for raw_window_edge in snapshot.get("context_window_edges", []):
+                self._upsert_snapshot_context_window_edge(
+                    connection,
+                    {**raw_window_edge, "tenant_id": self.tenant_id},
+                )
+
+            for raw_window in snapshot.get("context_windows", []):
+                window_id = str(raw_window.get("id", "")).strip()
+                if window_id:
+                    self._update_window_node_count(connection, window_id)
+                    self._mark_window_embedding_stale(connection, window_id)
         return result
 
     def decompose_and_store(self, *, content: str, context: str = "") -> SubgraphResult:
@@ -2202,7 +3322,7 @@ class MemoryGraph:
                     transcript_text=text,
                 )
 
-        return self._apply_observation_candidates(
+        result = self._apply_observation_candidates(
             candidates=candidates,
             transcript=transcript,
             user_turn_index=next_turn_index,
@@ -2212,6 +3332,11 @@ class MemoryGraph:
             agent_id=agent_id,
             project=project,
         )
+        repo_id, window_id = self.resolve_window_context(project=project, session_id=session_id)
+        self.update_window_node_count(window_id)
+        self.mark_window_embedding_stale(window_id)
+        self.derive_context_window_edges(window_id, repo_id)
+        return result
 
     # ---------------------------------------------------------------------------
     # Batch transcript ingestion (ingest-transcript-handoff)
@@ -2657,10 +3782,21 @@ class MemoryGraph:
             similarity_by_id = {nid: 0.0 for nid in expanded_depths}
             lexical_by_id = {nid: 0.0 for nid in expanded_depths}
             negation_boost_by_id = {nid: 0.0 for nid in expanded_depths}
+            transcript_session_scores = self._recent_transcript_session_scores(
+                agent_id=agent_id,
+                project=project,
+                session_id=active_session_id,
+            )
             # Boost seed IDs synthetically
             for seed_id in seed_ids:
                 if seed_id in similarity_by_id:
                     similarity_by_id[seed_id] = 0.5
+            for node_id in similarity_by_id:
+                similarity_by_id[node_id] = self._blend_session_signal(
+                    base_similarity=similarity_by_id[node_id],
+                    session_signal=transcript_session_scores.get(nodes_by_id[node_id].session_id, 0.0),
+                    session_weight=0.35,
+                )
 
             degree_by_id = dict(graph.degree(expanded_depths.keys()))
             max_access = max((node.access_count for node in candidate_nodes), default=0)
@@ -2814,7 +3950,7 @@ class MemoryGraph:
     ) -> tuple[Node, str, float | None] | None:
         rows = connection.execute(
             """
-            SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt, metadata, evidence_records,
+            SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, source_prompt, metadata, evidence_records,
                    valid_from, valid_to, created_at, updated_at, access_count, embedding, tenant_id
             FROM nodes
             WHERE tenant_id = ? AND embedding IS NOT NULL
@@ -2972,13 +4108,15 @@ class MemoryGraph:
         connection.execute(
             """
             UPDATE nodes
-            SET agent_id = ?, project = ?, session_id = ?, tags = ?, metadata = ?, source_prompt = ?, evidence_records = ?, valid_from = ?, valid_to = ?, updated_at = ?
+            SET agent_id = ?, project = ?, session_id = ?, context_window_id = COALESCE(context_window_id, ?),
+                tags = ?, metadata = ?, source_prompt = ?, evidence_records = ?, valid_from = ?, valid_to = ?, updated_at = ?
             WHERE id = ? AND tenant_id = ?
             """,
             (
                 _merge_scope_value(existing_node.agent_id, incoming_node.agent_id),
                 _merge_scope_value(existing_node.project, incoming_node.project),
                 _merge_scope_value(existing_node.session_id, incoming_node.session_id),
+                incoming_node.context_window_id,
                 json.dumps(merged_tags),
                 _encode_metadata(merged_metadata),
                 updated_source_prompt,
@@ -2996,6 +4134,7 @@ class MemoryGraph:
             agent_id=_merge_scope_value(existing_node.agent_id, incoming_node.agent_id),
             project=_merge_scope_value(existing_node.project, incoming_node.project),
             session_id=_merge_scope_value(existing_node.session_id, incoming_node.session_id),
+            context_window_id=existing_node.context_window_id or incoming_node.context_window_id,
             label=existing_node.label,
             content=existing_node.content,
             node_type=existing_node.node_type,
@@ -3020,7 +4159,7 @@ class MemoryGraph:
 
         rows = connection.execute(
             """
-            SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt, metadata,
+            SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, source_prompt, metadata,
                    evidence_records, valid_from, valid_to, created_at, updated_at, access_count, embedding, tenant_id
             FROM nodes
             WHERE tenant_id = ? AND id != ?
@@ -3107,7 +4246,7 @@ class MemoryGraph:
     def _fetch_node_row(self, connection: sqlite3.Connection, node_id: str) -> sqlite3.Row | None:
         return connection.execute(
             """
-            SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt, metadata, evidence_records, valid_from, valid_to,
+            SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, source_prompt, metadata, evidence_records, valid_from, valid_to,
                    created_at, updated_at, access_count, embedding, tenant_id
             FROM nodes
             WHERE id = ? AND tenant_id = ?
@@ -3125,7 +4264,7 @@ class MemoryGraph:
         placeholders = ", ".join("?" for _ in node_ids)
         rows = connection.execute(
             f"""
-            SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt, metadata, evidence_records, valid_from, valid_to,
+            SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, source_prompt, metadata, evidence_records, valid_from, valid_to,
                    created_at, updated_at, access_count, tenant_id
             FROM nodes
             WHERE tenant_id = ? AND id IN ({placeholders})
@@ -3257,6 +4396,7 @@ class MemoryGraph:
             agent_id=row["agent_id"] if "agent_id" in row_keys else "",
             project=row["project"] if "project" in row_keys else "",
             session_id=row["session_id"] if "session_id" in row_keys else "",
+            context_window_id=row["context_window_id"] if "context_window_id" in row_keys else None,
             label=row["label"],
             content=row["content"],
             node_type=NodeType(row["node_type"]),
@@ -3269,6 +4409,34 @@ class MemoryGraph:
             created_at=_parse_datetime(row["created_at"]),
             updated_at=_parse_datetime(row["updated_at"]),
             access_count=int(row["access_count"] or 0),
+        )
+
+    def _row_to_context_window(self, row: sqlite3.Row) -> ContextWindow:
+        return ContextWindow(
+            id=row["id"],
+            tenant_id=row["tenant_id"] if "tenant_id" in row.keys() else self.tenant_id,
+            repo_id=row["repo_id"],
+            session_id=row["session_id"],
+            title=row["title"] or "",
+            status=row["status"] or "active",
+            node_count=int(row["node_count"] or 0),
+            embedding_stale=bool(row["embedding_stale"]),
+            created_at=_parse_datetime(row["created_at"]),
+            updated_at=_parse_datetime(row["updated_at"]),
+            closed_at=_parse_datetime(row["closed_at"]) if row["closed_at"] else None,
+        )
+
+    def _row_to_context_window_edge(self, row: sqlite3.Row) -> ContextWindowEdge:
+        return ContextWindowEdge(
+            id=row["id"],
+            tenant_id=row["tenant_id"] if "tenant_id" in row.keys() else self.tenant_id,
+            source_window_id=row["source_window_id"],
+            target_window_id=row["target_window_id"],
+            edge_type=row["edge_type"],
+            shared_entities=json.loads(row["shared_entities"] or "[]"),
+            weight=float(row["weight"] if row["weight"] is not None else 1.0),
+            metadata=_decode_metadata(row["metadata"]),
+            created_at=_parse_datetime(row["created_at"]),
         )
 
     def _row_to_edge(self, row: sqlite3.Row) -> Edge:
@@ -4276,7 +5444,7 @@ class MemoryGraph:
     def _build_backup_snapshot(self, connection: sqlite3.Connection) -> dict[str, Any]:
         node_rows = connection.execute(
             """
-            SELECT id, tenant_id, agent_id, project, session_id, label, content, node_type, tags, source_prompt, metadata,
+            SELECT id, tenant_id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, source_prompt, metadata,
                    evidence_records, valid_from, valid_to, created_at, updated_at, access_count
             FROM nodes
             WHERE tenant_id = ?
@@ -4291,9 +5459,79 @@ class MemoryGraph:
             ORDER BY created_at ASC
             """
         , (self.tenant_id,)).fetchall()
+        repo_rows = connection.execute(
+            """
+            SELECT id, tenant_id, name, description, created_at, updated_at
+            FROM repos
+            WHERE tenant_id = ?
+            ORDER BY created_at ASC
+            """,
+            (self.tenant_id,),
+        ).fetchall()
+        window_rows = connection.execute(
+            """
+            SELECT id, tenant_id, repo_id, session_id, title, status, node_count,
+                   embedding_stale, created_at, updated_at, closed_at
+            FROM context_windows
+            WHERE tenant_id = ?
+            ORDER BY created_at ASC
+            """,
+            (self.tenant_id,),
+        ).fetchall()
+        window_edge_rows = connection.execute(
+            """
+            SELECT id, tenant_id, source_window_id, target_window_id, edge_type,
+                   shared_entities, weight, metadata, created_at
+            FROM context_window_edges
+            WHERE tenant_id = ?
+            ORDER BY created_at ASC
+            """,
+            (self.tenant_id,),
+        ).fetchall()
         return {
             "schema_version": SCHEMA_VERSION,
             "tenant_id": self.tenant_id,
+            "repos": [
+                {
+                    "id": row["id"],
+                    "tenant_id": row["tenant_id"],
+                    "name": row["name"],
+                    "description": row["description"] or "",
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in repo_rows
+            ],
+            "context_windows": [
+                {
+                    "id": row["id"],
+                    "tenant_id": row["tenant_id"],
+                    "repo_id": row["repo_id"],
+                    "session_id": row["session_id"],
+                    "title": row["title"] or "",
+                    "status": row["status"] or "active",
+                    "node_count": int(row["node_count"] or 0),
+                    "embedding_stale": True,
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                    "closed_at": row["closed_at"],
+                }
+                for row in window_rows
+            ],
+            "context_window_edges": [
+                {
+                    "id": row["id"],
+                    "tenant_id": row["tenant_id"],
+                    "source_window_id": row["source_window_id"],
+                    "target_window_id": row["target_window_id"],
+                    "edge_type": row["edge_type"],
+                    "shared_entities": json.loads(row["shared_entities"] or "[]"),
+                    "weight": float(row["weight"] if row["weight"] is not None else 1.0),
+                    "metadata": _decode_metadata(row["metadata"]),
+                    "created_at": row["created_at"],
+                }
+                for row in window_edge_rows
+            ],
             "nodes": [
                 {
                     "id": row["id"],
@@ -4301,6 +5539,7 @@ class MemoryGraph:
                     "agent_id": row["agent_id"] or "",
                     "project": row["project"] or "",
                     "session_id": row["session_id"] or "",
+                    "context_window_id": row["context_window_id"],
                     "label": row["label"],
                     "content": row["content"],
                     "node_type": row["node_type"],
@@ -4336,10 +5575,10 @@ class MemoryGraph:
         connection.execute(
             """
             INSERT INTO nodes (
-                id, tenant_id, agent_id, project, session_id, label, content, node_type, tags, metadata, embedding,
+                id, tenant_id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, metadata, embedding,
                 source_prompt, evidence_records, valid_from, valid_to, created_at, updated_at, access_count
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 raw_node["id"],
@@ -4347,6 +5586,7 @@ class MemoryGraph:
                 raw_node.get("agent_id", ""),
                 raw_node.get("project", ""),
                 raw_node.get("session_id", ""),
+                raw_node.get("context_window_id"),
                 raw_node["label"],
                 raw_node["content"],
                 raw_node["node_type"],
@@ -4363,12 +5603,100 @@ class MemoryGraph:
             ),
         )
 
+    def _upsert_snapshot_repo(self, connection: sqlite3.Connection, raw_repo: dict[str, Any]) -> None:
+        now = utc_now().isoformat()
+        connection.execute(
+            """
+            INSERT INTO repos (id, tenant_id, name, description, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                tenant_id = excluded.tenant_id,
+                name = excluded.name,
+                description = excluded.description,
+                updated_at = excluded.updated_at
+            """,
+            (
+                raw_repo["id"],
+                raw_repo.get("tenant_id", self.tenant_id),
+                raw_repo.get("name", raw_repo["id"]),
+                raw_repo.get("description", ""),
+                raw_repo.get("created_at") or now,
+                raw_repo.get("updated_at") or now,
+            ),
+        )
+
+    def _upsert_snapshot_context_window(self, connection: sqlite3.Connection, raw_window: dict[str, Any]) -> None:
+        now = utc_now().isoformat()
+        connection.execute(
+            """
+            INSERT INTO context_windows (
+                id, tenant_id, repo_id, session_id, title, status, node_count,
+                embedding, embedding_stale, created_at, updated_at, closed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                tenant_id = excluded.tenant_id,
+                repo_id = excluded.repo_id,
+                session_id = excluded.session_id,
+                title = excluded.title,
+                status = excluded.status,
+                node_count = excluded.node_count,
+                embedding = NULL,
+                embedding_stale = 1,
+                updated_at = excluded.updated_at,
+                closed_at = excluded.closed_at
+            """,
+            (
+                raw_window["id"],
+                raw_window.get("tenant_id", self.tenant_id),
+                raw_window["repo_id"],
+                raw_window.get("session_id", "default"),
+                raw_window.get("title", ""),
+                raw_window.get("status", "active"),
+                int(raw_window.get("node_count", 0)),
+                raw_window.get("created_at") or now,
+                raw_window.get("updated_at") or now,
+                raw_window.get("closed_at"),
+            ),
+        )
+
+    def _upsert_snapshot_context_window_edge(self, connection: sqlite3.Connection, raw_edge: dict[str, Any]) -> None:
+        connection.execute(
+            """
+            INSERT INTO context_window_edges (
+                id, tenant_id, source_window_id, target_window_id, edge_type,
+                shared_entities, weight, metadata, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                tenant_id = excluded.tenant_id,
+                source_window_id = excluded.source_window_id,
+                target_window_id = excluded.target_window_id,
+                edge_type = excluded.edge_type,
+                shared_entities = excluded.shared_entities,
+                weight = excluded.weight,
+                metadata = excluded.metadata,
+                created_at = excluded.created_at
+            """,
+            (
+                raw_edge["id"],
+                raw_edge.get("tenant_id", self.tenant_id),
+                raw_edge["source_window_id"],
+                raw_edge["target_window_id"],
+                raw_edge["edge_type"],
+                json.dumps(raw_edge.get("shared_entities", []), sort_keys=True),
+                float(raw_edge.get("weight", 1.0)),
+                _encode_metadata(raw_edge.get("metadata", {})),
+                raw_edge["created_at"],
+            ),
+        )
+
     def _update_snapshot_node(self, connection: sqlite3.Connection, raw_node: dict[str, Any]) -> None:
         embedding = self.embedding_model.to_bytes(self.embedding_model.embed(raw_node["content"]))
         connection.execute(
             """
             UPDATE nodes
-            SET tenant_id = ?, agent_id = ?, project = ?, session_id = ?, label = ?, content = ?, node_type = ?, tags = ?, metadata = ?, embedding = ?,
+            SET tenant_id = ?, agent_id = ?, project = ?, session_id = ?, context_window_id = ?, label = ?, content = ?, node_type = ?, tags = ?, metadata = ?, embedding = ?,
                 source_prompt = ?, evidence_records = ?, valid_from = ?, valid_to = ?,
                 created_at = ?, updated_at = ?, access_count = ?
             WHERE id = ? AND tenant_id = ?
@@ -4378,6 +5706,7 @@ class MemoryGraph:
                 raw_node.get("agent_id", ""),
                 raw_node.get("project", ""),
                 raw_node.get("session_id", ""),
+                raw_node.get("context_window_id"),
                 raw_node["label"],
                 raw_node["content"],
                 raw_node["node_type"],

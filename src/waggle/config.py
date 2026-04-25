@@ -35,6 +35,8 @@ class AppConfig:
     neo4j_password: str
     neo4j_database: str
     recency_half_life_days: float = 30.0
+    tiered_retrieval: bool = False
+    tiered_retrieval_top_k_windows: int = 3
     startup_mode: str = STARTUP_MODE_NORMAL  # fast | normal | strict
 
     @classmethod
@@ -60,6 +62,8 @@ class AppConfig:
             neo4j_password=os.environ.get("WAGGLE_NEO4J_PASSWORD", ""),
             neo4j_database=os.environ.get("WAGGLE_NEO4J_DATABASE", "").strip(),
             startup_mode=os.environ.get("WAGGLE_STARTUP_MODE", STARTUP_MODE_NORMAL).strip().lower(),
+            tiered_retrieval=os.environ.get("WAGGLE_TIERED_RETRIEVAL", "false").strip().lower() == "true",
+            tiered_retrieval_top_k_windows=int(os.environ.get("WAGGLE_TIERED_TOP_K_WINDOWS", "3")),
         )
         config.validate()
         return config
@@ -86,6 +90,8 @@ class AppConfig:
             )
         if self.recency_half_life_days <= 0:
             raise ValidationFailure("WAGGLE_RECENCY_HALF_LIFE_DAYS must be greater than 0.")
+        if self.tiered_retrieval_top_k_windows < 1:
+            raise ValidationFailure("WAGGLE_TIERED_TOP_K_WINDOWS must be at least 1.")
 
     @property
     def is_fast_mode(self) -> bool:

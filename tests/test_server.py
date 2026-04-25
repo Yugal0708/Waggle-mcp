@@ -95,6 +95,9 @@ def test_store_node_and_stats_tool(tmp_path: Path) -> None:
     stats_result = app.handle_tool_call("get_stats", {})
     assert "Memory Graph Stats" in stats_result.content[0].text
     assert stats_result.structuredContent["total_nodes"] == 1
+    assert stats_result.structuredContent["total_repos"] == 1
+    assert stats_result.structuredContent["total_context_windows"] == 1
+    assert "Context windows: 1" in stats_result.content[0].text
 
 
 def test_tool_schemas_are_glama_friendly(tmp_path: Path) -> None:
@@ -165,6 +168,34 @@ def test_export_graph_html_tool(tmp_path: Path) -> None:
     assert result.structuredContent["total_nodes"] == 1
     assert Path(result.structuredContent["output_path"]).exists()
     assert "Exported graph visualization" in result.content[0].text
+
+
+def test_window_graph_viz_tool(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.handle_tool_call(
+        "store_node",
+        {
+            "label": "Window Viz Node",
+            "content": "The context-window graph should be exportable as HTML.",
+            "node_type": NodeType.CONCEPT.value,
+            "project": "alpha",
+            "session_id": "sess-1",
+        },
+    )
+
+    result = app.handle_tool_call(
+        "window_graph_viz",
+        {
+            "project": "alpha",
+            "output_path": str(tmp_path / "window-viz.html"),
+            "include_physics": False,
+        },
+    )
+
+    assert result.isError is False
+    assert result.structuredContent["total_context_windows"] == 1
+    assert Path(result.structuredContent["output_path"]).exists()
+    assert "Exported context-window graph visualization" in result.content[0].text
 
 
 def test_decompose_and_store_tool_persists_subgraph(tmp_path: Path) -> None:
@@ -349,6 +380,56 @@ def test_list_context_scopes_tool(tmp_path: Path) -> None:
     assert result.structuredContent["agent_ids"] == ["codex"]
     assert result.structuredContent["projects"] == ["alpha"]
     assert result.structuredContent["session_ids"] == ["sess-1"]
+
+
+def test_context_window_tools(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    stored = app.handle_tool_call(
+        "store_node",
+        {
+            "label": "Window Tool Node",
+            "content": "Context window tools should expose session containers.",
+            "node_type": NodeType.FACT.value,
+            "project": "alpha",
+            "session_id": "sess-1",
+        },
+    )
+    window_id = stored.structuredContent["context_window_id"]
+
+    listed = app.handle_tool_call("list_context_windows", {"project": "alpha"})
+    fetched = app.handle_tool_call("get_context_window", {"window_id": window_id})
+    closed = app.handle_tool_call("close_context_window", {"window_id": window_id})
+
+    assert listed.isError is False
+    assert listed.structuredContent["windows"][0]["id"] == window_id
+    assert fetched.isError is False
+    assert fetched.structuredContent["window"]["id"] == window_id
+    assert fetched.structuredContent["nodes"][0]["label"] == "Window Tool Node"
+    assert closed.isError is False
+    assert closed.structuredContent["window"]["status"] == "closed"
+
+
+def test_debug_retrieval_tool(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.handle_tool_call(
+        "store_node",
+        {
+            "label": "Debug Retrieval Node",
+            "content": "Debug retrieval should expose flat and tiered comparison details.",
+            "node_type": NodeType.FACT.value,
+            "project": "alpha",
+            "session_id": "sess-1",
+        },
+    )
+
+    result = app.handle_tool_call("debug_retrieval", {"query": "debug retrieval details", "project": "alpha"})
+
+    assert result.isError is False
+    assert result.structuredContent["repo_id"].endswith(":alpha")
+    assert result.structuredContent["embedding_preview"]
+    assert result.structuredContent["selected_windows"]
+    assert result.structuredContent["flat_top_nodes"]
+    assert result.structuredContent["tiered_top_nodes"]
 
 
 def test_export_context_bundle_cli_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -546,6 +627,22 @@ def test_recent_resource_serialization(tmp_path: Path) -> None:
     resource_text = app.read_resource_text("graph://recent")
     assert "Recent Memory Nodes" in resource_text
     assert "Architecture" in resource_text
+
+
+def test_context_windows_resource_serialization(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.graph.add_node(
+        label="Architecture",
+        content="The project uses SQLite and NetworkX",
+        node_type=NodeType.CONCEPT,
+        project="alpha",
+        session_id="sess-1",
+    )
+
+    resource_text = app.read_resource_text("graph://windows")
+
+    assert "Context Windows" in resource_text
+    assert "sess-1" in resource_text
 
 
 def test_unknown_tool_raises(tmp_path: Path) -> None:

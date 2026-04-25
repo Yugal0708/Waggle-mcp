@@ -48,6 +48,7 @@ class Node(BaseModel):
     agent_id: str = ""
     project: str = ""
     session_id: str = ""
+    context_window_id: str | None = None
     label: str
     content: str
     node_type: NodeType
@@ -88,6 +89,14 @@ class Node(BaseModel):
         if value is None:
             return ""
         return str(value).strip()
+
+    @field_validator("context_window_id", mode="before")
+    @classmethod
+    def _normalize_optional_scope_text(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
     @field_validator("tags", mode="before")
     @classmethod
@@ -167,9 +176,63 @@ class RecentNodeStat(BaseModel):
 class GraphStats(BaseModel):
     total_nodes: int = 0
     total_edges: int = 0
+    total_repos: int = 0
+    total_context_windows: int = 0
+    context_window_status_breakdown: dict[str, int] = Field(default_factory=dict)
+    total_context_window_edges: int = 0
+    context_window_edge_type_breakdown: dict[str, int] = Field(default_factory=dict)
+    windows_with_embeddings: int = 0
+    windows_with_stale_embeddings: int = 0
     node_type_breakdown: dict[str, int] = Field(default_factory=dict)
     most_connected_nodes: list[ConnectedNodeStat] = Field(default_factory=list)
     most_recent_nodes: list[RecentNodeStat] = Field(default_factory=list)
+
+
+class Repo(BaseModel):
+    id: str
+    tenant_id: str = ""
+    name: str
+    description: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ContextWindow(BaseModel):
+    id: str
+    tenant_id: str = ""
+    repo_id: str
+    session_id: str
+    title: str = ""
+    status: str = "active"
+    node_count: int = 0
+    embedding_stale: bool = True
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    closed_at: datetime | None = None
+
+
+class ContextWindowEdge(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    tenant_id: str = ""
+    source_window_id: str
+    target_window_id: str
+    edge_type: str
+    shared_entities: list[str] = Field(default_factory=list)
+    weight: float = Field(default=1.0, ge=0.0, le=1.0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class BackfillStats(BaseModel):
+    nodes_scanned: int = 0
+    nodes_assigned: int = 0
+    nodes_skipped_already_assigned: int = 0
+    repos_created: int = 0
+    windows_created: int = 0
+    window_edges_created: int = 0
+    embeddings_computed: int = 0
+    errors: list[str] = Field(default_factory=list)
+    dry_run: bool = False
 
 
 class SubgraphResult(BaseModel):

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import networkx as nx
 import numpy as np
@@ -37,6 +39,46 @@ class FakeEmbeddingModel:
 
 def make_graph(tmp_path: Path) -> MemoryGraph:
     return MemoryGraph(tmp_path / "memory.db", FakeEmbeddingModel())
+
+
+def _set_node_timestamp(graph: MemoryGraph, node_id: str, timestamp: datetime) -> None:
+    with graph._lock, graph._connect() as connection:
+        connection.execute(
+            "UPDATE nodes SET created_at = ?, updated_at = ? WHERE id = ?",
+            (timestamp.isoformat(), timestamp.isoformat(), node_id),
+        )
+
+
+def _insert_transcript_record(
+    graph: MemoryGraph,
+    *,
+    session_id: str,
+    project: str,
+    transcript_text: str,
+    observed_at: datetime,
+    role: str = "user",
+) -> None:
+    embedding = graph.embedding_model.to_bytes(graph.embedding_model.embed(transcript_text))
+    with graph._lock, graph._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO transcript_records (
+                id, tenant_id, agent_id, project, session_id, observed_at, turn_index, role,
+                transcript_text, embedding, metadata, message_identity
+            )
+            VALUES (?, ?, '', ?, ?, ?, 0, ?, ?, ?, '{}', NULL)
+            """,
+            (
+                str(uuid4()),
+                graph.tenant_id,
+                project,
+                session_id,
+                observed_at.isoformat(),
+                role,
+                transcript_text,
+                embedding,
+            ),
+        )
 
 
 def test_add_query_and_related(tmp_path: Path) -> None:
@@ -287,6 +329,40 @@ def test_export_graph_html_creates_visualization_file(tmp_path: Path) -> None:
     assert "part_of" in html
 
 
+def test_export_window_graph_html_creates_visualization_file(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    graph.add_node(
+        label="Deployment",
+        content="Deployment uses Kubernetes.",
+        node_type=NodeType.FACT,
+        project="alpha",
+        session_id="chat-a",
+    )
+    graph.add_node(
+        label="Deployment",
+        content="Deployment uses Kubernetes.",
+        node_type=NodeType.FACT,
+        project="alpha",
+        session_id="chat-b",
+    )
+    repo_id = graph.ensure_repo("alpha")
+    windows = graph.get_repo_windows(repo_id)
+    for window in windows:
+        graph.derive_context_window_edges(window.id, repo_id)
+
+    output_path = graph.export_window_graph_html(
+        project="alpha",
+        output_path=tmp_path / "window-graph.html",
+        include_physics=False,
+    )
+    html = output_path.read_text(encoding="utf-8")
+
+    assert output_path.exists()
+    assert "chat-a" in html
+    assert "chat-b" in html
+    assert "entity_overlap" in html
+
+
 def test_export_context_bundle_query_writes_markdown_and_json(tmp_path: Path) -> None:
     graph = make_graph(tmp_path)
     decision = graph.add_node(
@@ -432,6 +508,83 @@ def test_query_fusion_mode_includes_graph_and_replay_provenance(tmp_path: Path) 
     assert result.fusion_hits
     assert result.fusion_hits[0].source_lane in {"graph", "replay", "both"}
     assert result.fusion_hits[0].fused_rank >= 1
+
+
+def test_query_graph_mode_uses_transcript_session_signal_for_node_ranking(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    timestamp = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    node_a = graph.add_node(
+        label="Session A Note",
+        content="Shared planning note.",
+        node_type=NodeType.NOTE,
+        project="alpha",
+        session_id="sess-a",
+    ).node
+    node_b = graph.add_node(
+        label="Session B Note",
+        content="Shared planning note.",
+        node_type=NodeType.NOTE,
+        project="alpha",
+        session_id="sess-b",
+    ).node
+    _set_node_timestamp(graph, node_a.id, timestamp)
+    _set_node_timestamp(graph, node_b.id, timestamp)
+
+    _insert_transcript_record(
+        graph,
+        session_id="sess-a",
+        project="alpha",
+        transcript_text="We chose PostgreSQL for production.",
+        observed_at=datetime(2024, 2, 1, tzinfo=timezone.utc),
+    )
+
+    result = graph.query(
+        query="what database did we choose for production",
+        max_nodes=2,
+        max_depth=0,
+        project="alpha",
+    )
+
+    assert result.nodes
+    assert result.nodes[0].label == "Session A Note"
+    assert result.nodes[0].similarity_score is not None
+    assert result.nodes[0].final_score is not None
+
+
+def test_prime_context_prefers_nodes_from_recent_transcript_sessions(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    timestamp = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    active = graph.add_node(
+        label="Active Session Decision",
+        content="Shared context note.",
+        node_type=NodeType.DECISION,
+        project="alpha",
+        session_id="sess-active",
+        tags=["alpha"],
+    ).node
+    quiet = graph.add_node(
+        label="Quiet Session Decision",
+        content="Shared context note.",
+        node_type=NodeType.DECISION,
+        project="alpha",
+        session_id="sess-quiet",
+        tags=["alpha"],
+    ).node
+    _set_node_timestamp(graph, active.id, timestamp)
+    _set_node_timestamp(graph, quiet.id, timestamp)
+
+    _insert_transcript_record(
+        graph,
+        session_id="sess-active",
+        project="alpha",
+        transcript_text="We are actively working on the rollout plan today.",
+        observed_at=datetime(2024, 2, 1, tzinfo=timezone.utc),
+    )
+
+    result = graph.prime_context(project="alpha", max_nodes=2)
+
+    assert result.nodes
+    assert result.nodes[0].label == "Active Session Decision"
 
 
 def test_export_context_bundle_fusion_includes_replay_hits(tmp_path: Path) -> None:

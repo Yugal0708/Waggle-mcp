@@ -45,6 +45,8 @@ from waggle.models import (
     ConflictListResult,
     ContextBundleExportResult,
     ContextScopeResult,
+    ContextWindow,
+    ContextWindowEdge,
     GraphDiffResult,
     GraphStats,
     MarkdownVaultExportResult,
@@ -200,6 +202,8 @@ def _build_backend(config: AppConfig) -> Any:
             embedding_model,
             tenant_id=config.default_tenant_id,
             recency_half_life_days=config.recency_half_life_days,
+            tiered_retrieval=config.tiered_retrieval,
+            tiered_retrieval_top_k_windows=config.tiered_retrieval_top_k_windows,
             export_dir=config.export_dir,
         )
     from waggle.neo4j_graph import Neo4jMemoryGraph
@@ -365,6 +369,32 @@ class WaggleServer:
                 ),
             ),
             types.Tool(
+                name="debug_retrieval",
+                description=(
+                    "Diagnose memory retrieval ranking for a query. Returns query embedding preview, context-window "
+                    "routing scores, selected windows, flat top nodes, and tiered top nodes for comparison."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "query": {"type": "string", "description": "Natural-language search query to diagnose."},
+                        "max_nodes": {
+                            "type": "integer",
+                            "default": 10,
+                            "minimum": 1,
+                            "description": "Maximum number of flat and tiered node matches to include.",
+                        },
+                        "max_depth": {
+                            "type": "integer",
+                            "default": 2,
+                            "minimum": 0,
+                            "description": "Relationship traversal depth for the flat retrieval comparison.",
+                        },
+                        **_scope_properties(),
+                    },
+                    required=["query"],
+                ),
+            ),
+            types.Tool(
                 name="get_related",
                 description=(
                     "Fetch the neighborhood around a specific memory node. Use when you already have a node ID "
@@ -409,6 +439,61 @@ class WaggleServer:
                     "Use before filtering memory by scope. Returns arrays of scope identifiers."
                 ),
                 inputSchema=_object_input_schema(),
+            ),
+            types.Tool(
+                name="list_context_windows",
+                description=(
+                    "List context windows for a project. Use to inspect chat/session-level memory containers, "
+                    "their status, node counts, and update times."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "project": {
+                            "type": "string",
+                            "description": "Optional project/repository scope to filter windows.",
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["active", "closed", "archived"],
+                            "description": "Optional status filter for returned windows.",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "default": 20,
+                            "minimum": 1,
+                            "description": "Maximum number of context windows to return.",
+                        },
+                    }
+                ),
+            ),
+            types.Tool(
+                name="get_context_window",
+                description=(
+                    "Inspect one context window, including its nodes and links to other context windows. "
+                    "Use when auditing what a conversation/session contributed to memory."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "window_id": {"type": "string", "description": "ID of the context window to inspect."},
+                        "include_nodes": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Whether to include memory nodes stored in this context window.",
+                        },
+                    },
+                    required=["window_id"],
+                ),
+            ),
+            types.Tool(
+                name="close_context_window",
+                description=(
+                    "Close a context window, recompute its final graph embedding, refresh node counts, "
+                    "and derive cross-window edges. Use when a chat/session is complete."
+                ),
+                inputSchema=_object_input_schema(
+                    {"window_id": {"type": "string", "description": "ID of the context window to close."}},
+                    required=["window_id"],
+                ),
             ),
             types.Tool(
                 name="timeline",
@@ -594,6 +679,30 @@ class WaggleServer:
                 ),
                 inputSchema=_object_input_schema(
                     {
+                        "output_path": {
+                            "type": "string",
+                            "description": "Optional destination HTML file path. If omitted, Waggle chooses an export path.",
+                        },
+                        "include_physics": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Whether the visualization should use physics-based node layout.",
+                        },
+                    },
+                ),
+            ),
+            types.Tool(
+                name="window_graph_viz",
+                description=(
+                    "Export the context-window graph as an interactive HTML visualization. "
+                    "Each node is a chat/session window and edges show overlap, supersession, temporal order, or shared scope."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "project": {
+                            "type": "string",
+                            "description": "Optional project/repository scope whose context-window graph should be exported.",
+                        },
                         "output_path": {
                             "type": "string",
                             "description": "Optional destination HTML file path. If omitted, Waggle chooses an export path.",
@@ -842,6 +951,7 @@ class WaggleServer:
             resources=[
                 types.Resource(uri="graph://stats", name="Graph Stats", description="Current graph statistics.", mimeType="text/plain"),
                 types.Resource(uri="graph://recent", name="Recent Graph Nodes", description="The 10 most recently updated nodes.", mimeType="text/plain"),
+                types.Resource(uri="graph://windows", name="Context Windows", description="Recent context windows grouped by project/session.", mimeType="text/plain"),
                 types.Resource(
                     uri="graph://memory-policy",
                     name="Automatic Memory Policy",
@@ -857,6 +967,18 @@ class WaggleServer:
             return serialize_stats(graph.get_stats())
         if uri == "graph://recent":
             return serialize_recent_nodes(graph.list_recent_nodes(limit=10))
+        if uri == "graph://windows":
+            windows = graph.list_context_windows(limit=50)
+            if not windows:
+                return "=== Context Windows: No context windows stored ==="
+            lines = ["=== Context Windows ==="]
+            for window in windows:
+                lines.append(
+                    f"• {window.id} [{window.status}] session={window.session_id} "
+                    f"nodes={window.node_count} updated={window.updated_at.isoformat()}"
+                )
+            lines.append("=== End Context Windows ===")
+            return "\n".join(lines)
         if uri == "graph://memory-policy":
             return MEMORY_AUTOMATION_POLICY
         raise ValidationFailure(f"Unknown resource: {uri}")
@@ -1001,11 +1123,56 @@ class WaggleServer:
                         serialize_subgraph(subgraph),
                         self._subgraph_payload(subgraph),
                     )
+                elif name == "debug_retrieval":
+                    debug = graph.debug_retrieval(
+                        query=arguments["query"],
+                        max_nodes=int(arguments.get("max_nodes", 10)),
+                        max_depth=int(arguments.get("max_depth", 2)),
+                        agent_id=arguments.get("agent_id", ""),
+                        project=arguments.get("project", ""),
+                        session_id=arguments.get("session_id", ""),
+                    )
+                    result = self._tool_result(
+                        json.dumps(debug, indent=2),
+                        debug,
+                    )
                 elif name == "list_context_scopes":
                     scopes = graph.list_context_scopes()
                     result = self._tool_result(
                         f"Known scopes: {len(scopes.agent_ids)} agents, {len(scopes.projects)} projects, {len(scopes.session_ids)} sessions.",
                         self._context_scope_payload(scopes),
+                    )
+                elif name == "list_context_windows":
+                    windows = graph.list_context_windows(
+                        project=arguments.get("project", ""),
+                        status=arguments.get("status", ""),
+                        limit=int(arguments.get("limit", 20)),
+                    )
+                    result = self._tool_result(
+                        f"Context windows: {len(windows)}",
+                        {"windows": [self._context_window_payload(window) for window in windows]},
+                    )
+                elif name == "get_context_window":
+                    window = graph.get_context_window(arguments["window_id"])
+                    edges = graph.get_context_window_edges(window.id)
+                    nodes = graph.get_window_nodes(window.id) if bool(arguments.get("include_nodes", True)) else []
+                    result = self._tool_result(
+                        f"Context window {window.id}: {window.node_count} nodes, {len(edges)} connected window edge(s).",
+                        {
+                            "window": self._context_window_payload(window),
+                            "nodes": [self._node_payload(node) for node in nodes],
+                            "window_edges": [self._context_window_edge_payload(edge) for edge in edges],
+                        },
+                    )
+                elif name == "close_context_window":
+                    window = graph.close_context_window(arguments["window_id"])
+                    edges = graph.get_context_window_edges(window.id)
+                    result = self._tool_result(
+                        f"Closed context window {window.id} with {window.node_count} nodes and {len(edges)} connected window edge(s).",
+                        {
+                            "window": self._context_window_payload(window),
+                            "window_edges": [self._context_window_edge_payload(edge) for edge in edges],
+                        },
                     )
                 elif name == "get_related":
                     subgraph = graph.get_related(node_id=arguments["node_id"], max_depth=int(arguments.get("max_depth", 2)))
@@ -1108,6 +1275,24 @@ class WaggleServer:
                             "tenant_id": graph.tenant_id,
                             "total_nodes": stats.total_nodes,
                             "total_edges": stats.total_edges,
+                        },
+                    )
+                elif name == "window_graph_viz":
+                    output_path = graph.export_window_graph_html(
+                        project=arguments.get("project", ""),
+                        output_path=arguments.get("output_path"),
+                        include_physics=bool(arguments.get("include_physics", True)),
+                    )
+                    windows = graph.list_context_windows(project=arguments.get("project", ""), limit=10_000)
+                    edge_count = sum(len(graph.get_context_window_edges(window.id)) for window in windows)
+                    result = self._tool_result(
+                        f"Exported context-window graph visualization to {output_path}.",
+                        {
+                            "output_path": str(output_path),
+                            "tenant_id": graph.tenant_id,
+                            "project": arguments.get("project", ""),
+                            "total_context_windows": len(windows),
+                            "total_context_window_edges": edge_count,
                         },
                     )
                 elif name == "export_graph_backup":
@@ -1225,6 +1410,7 @@ class WaggleServer:
             "agent_id": node.agent_id,
             "project": node.project,
             "session_id": node.session_id,
+            "context_window_id": node.context_window_id,
             "label": node.label,
             "content": node.content,
             "node_type": node.node_type.value,
@@ -1368,6 +1554,34 @@ class WaggleServer:
             "session_ids": result.session_ids,
         }
 
+    def _context_window_payload(self, window: ContextWindow) -> dict[str, Any]:
+        return {
+            "id": window.id,
+            "tenant_id": window.tenant_id,
+            "repo_id": window.repo_id,
+            "session_id": window.session_id,
+            "title": window.title,
+            "status": window.status,
+            "node_count": window.node_count,
+            "embedding_stale": window.embedding_stale,
+            "created_at": window.created_at.isoformat(),
+            "updated_at": window.updated_at.isoformat(),
+            "closed_at": window.closed_at.isoformat() if window.closed_at is not None else None,
+        }
+
+    def _context_window_edge_payload(self, edge: ContextWindowEdge) -> dict[str, Any]:
+        return {
+            "id": edge.id,
+            "tenant_id": edge.tenant_id,
+            "source_window_id": edge.source_window_id,
+            "target_window_id": edge.target_window_id,
+            "edge_type": edge.edge_type,
+            "shared_entities": edge.shared_entities,
+            "weight": edge.weight,
+            "metadata": edge.metadata,
+            "created_at": edge.created_at.isoformat(),
+        }
+
     def _graph_diff_payload(self, result: GraphDiffResult) -> dict[str, Any]:
         return {
             "since": result.since,
@@ -1426,6 +1640,13 @@ class WaggleServer:
         return {
             "total_nodes": stats.total_nodes,
             "total_edges": stats.total_edges,
+            "total_repos": stats.total_repos,
+            "total_context_windows": stats.total_context_windows,
+            "context_window_status_breakdown": stats.context_window_status_breakdown,
+            "total_context_window_edges": stats.total_context_window_edges,
+            "context_window_edge_type_breakdown": stats.context_window_edge_type_breakdown,
+            "windows_with_embeddings": stats.windows_with_embeddings,
+            "windows_with_stale_embeddings": stats.windows_with_stale_embeddings,
             "node_type_breakdown": stats.node_type_breakdown,
             "most_connected_nodes": [
                 {
@@ -1496,12 +1717,22 @@ class WaggleServer:
             self._assert_payload_size(arguments.get("project", ""), limit, "query_graph.project")
             self._assert_payload_size(arguments.get("session_id", ""), limit, "query_graph.session_id")
             return
+        if name == "debug_retrieval":
+            self._assert_payload_size(arguments.get("query", ""), limit, "debug_retrieval.query")
+            self._assert_payload_size(arguments.get("agent_id", ""), limit, "debug_retrieval.agent_id")
+            self._assert_payload_size(arguments.get("project", ""), limit, "debug_retrieval.project")
+            self._assert_payload_size(arguments.get("session_id", ""), limit, "debug_retrieval.session_id")
+            return
         if name == "export_context_bundle":
             self._assert_payload_size(arguments.get("query", ""), limit, "export_context_bundle.query")
             self._assert_payload_size(arguments.get("project", ""), limit, "export_context_bundle.project")
             self._assert_payload_size(arguments.get("agent_id", ""), limit, "export_context_bundle.agent_id")
             self._assert_payload_size(arguments.get("session_id", ""), limit, "export_context_bundle.session_id")
             self._assert_payload_size(arguments.get("output_path", ""), limit, "export_context_bundle.output_path")
+            return
+        if name == "window_graph_viz":
+            self._assert_payload_size(arguments.get("project", ""), limit, "window_graph_viz.project")
+            self._assert_payload_size(arguments.get("output_path", ""), limit, "window_graph_viz.output_path")
             return
         if name == "timeline":
             self._assert_payload_size(arguments.get("query", ""), limit, "timeline.query")
@@ -1881,6 +2112,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     import_markdown_vault.add_argument("--root-path", required=True)
 
+    backfill_windows = subparsers.add_parser(
+        "backfill-windows",
+        help="Retroactively assign legacy nodes to context windows grouped by project/session.",
+    )
+    backfill_windows.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show backfill stats without assigning nodes or creating windows.",
+    )
+
     ingest_transcript_handoff = subparsers.add_parser(
         "ingest-transcript-handoff",
         help="Ingest a full session transcript as a rollover handoff, extract memory, and export a context bundle.",
@@ -2054,6 +2295,14 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
         imported = backend.import_markdown_vault(root_path=args.root_path)
         print(json.dumps(imported.model_dump(mode="json"), indent=2))
         return 0
+    if args.command == "backfill-windows":
+        from waggle.backfill import backfill_context_windows
+
+        if not isinstance(backend, MemoryGraph):
+            raise ValidationFailure("backfill-windows is currently supported only for the SQLite backend.")
+        stats = backfill_context_windows(backend, dry_run=bool(args.dry_run))
+        print(json.dumps(stats.model_dump(mode="json"), indent=2))
+        return 1 if stats.errors else 0
     if args.command == "ingest-transcript-handoff":
         return _run_ingest_transcript_handoff(config, args)
     if args.command == "features":

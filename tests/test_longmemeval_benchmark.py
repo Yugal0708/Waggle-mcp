@@ -153,6 +153,114 @@ def test_evaluate_longmemeval_reuses_disk_cache(tmp_path: Path) -> None:
     assert Path(first_report.cache_path).with_suffix(".npz").exists()
     assert not Path(first_report.cache_path).with_suffix(".pkl").exists()
 
+
+def test_graph_raw_prefers_verbatim_term_overlap_when_semantics_are_close(tmp_path: Path) -> None:
+    dataset = [
+        {
+            "id": "entry_1",
+            "question": "which session mentions PostgreSQL",
+            "haystack_sessions": [
+                [{"role": "user", "content": "We finalized the production database as PostgreSQL."}],
+                [{"role": "user", "content": "We finalized the production database as the main datastore."}],
+            ],
+            "haystack_session_ids": ["sess_exact", "sess_generic"],
+            "haystack_dates": ["2024/02/10 (Sat) 09:00", "2024/02/10 (Sat) 09:00"],
+            "correct_session_ids": ["sess_exact"],
+        }
+    ]
+    dataset_path = tmp_path / "longmemeval.json"
+    dataset_path.write_text(json.dumps(dataset), encoding="utf-8")
+
+    report = evaluate_longmemeval(dataset_path, embedding_model=FakeEmbeddingModel(), mode="graph_raw")
+
+    assert report.r_at_5 == 1.0
+    assert report.per_case[0].retrieved_session_ids[0] == "sess_exact"
+
+
+def test_graph_hybrid_keeps_raw_leader_when_rerank_is_only_secondary_signal(tmp_path: Path) -> None:
+    dataset = [
+        {
+            "id": "entry_1",
+            "question": "which session mentions PostgreSQL",
+            "haystack_sessions": [
+                [{"role": "user", "content": "We finalized the production database as PostgreSQL."}],
+                [{"role": "user", "content": "We finalized the production database as the main datastore."}],
+            ],
+            "haystack_session_ids": ["sess_exact", "sess_generic"],
+            "haystack_dates": ["2024/02/10 (Sat) 09:00", "2024/02/10 (Sat) 09:00"],
+            "correct_session_ids": ["sess_exact"],
+        }
+    ]
+    dataset_path = tmp_path / "longmemeval.json"
+    dataset_path.write_text(json.dumps(dataset), encoding="utf-8")
+
+    report = evaluate_longmemeval(dataset_path, embedding_model=FakeEmbeddingModel(), mode="graph_hybrid")
+
+    assert report.r_at_5 == 1.0
+    assert report.per_case[0].retrieved_session_ids[0] == "sess_exact"
+
+
+def test_graph_hybrid_chunk_rerank_finds_localized_answer_phrase(tmp_path: Path) -> None:
+    dataset = [
+        {
+            "id": "entry_1",
+            "question": "which session mentions ukulele lessons",
+            "haystack_sessions": [
+                [
+                    {"role": "user", "content": "We discussed travel plans and meal prep."},
+                    {"role": "assistant", "content": "We also covered hobbies."},
+                    {"role": "user", "content": "Rachel signed up for ukulele lessons last week."},
+                ],
+                [
+                    {"role": "user", "content": "We discussed travel plans and meal prep."},
+                    {"role": "assistant", "content": "We also covered hobbies in general terms."},
+                    {"role": "user", "content": "Rachel signed up for music classes last week."},
+                ],
+            ],
+            "haystack_session_ids": ["sess_uke", "sess_music"],
+            "haystack_dates": ["2024/02/10 (Sat) 09:00", "2024/02/10 (Sat) 09:00"],
+            "correct_session_ids": ["sess_uke"],
+        }
+    ]
+    dataset_path = tmp_path / "longmemeval.json"
+    dataset_path.write_text(json.dumps(dataset), encoding="utf-8")
+
+    report = evaluate_longmemeval(dataset_path, embedding_model=FakeEmbeddingModel(), mode="graph_hybrid")
+
+    assert report.r_at_5 == 1.0
+    assert report.per_case[0].retrieved_session_ids[0] == "sess_uke"
+
+
+def test_graph_raw_uses_chunk_candidates_as_first_class_signal(tmp_path: Path) -> None:
+    dataset = [
+        {
+            "id": "entry_1",
+            "question": "which session mentions ukulele lessons",
+            "haystack_sessions": [
+                [
+                    {"role": "user", "content": "We discussed travel plans and meal prep."},
+                    {"role": "assistant", "content": "We also covered hobbies."},
+                    {"role": "user", "content": "Rachel signed up for ukulele lessons last week."},
+                ],
+                [
+                    {"role": "user", "content": "We discussed travel plans and meal prep."},
+                    {"role": "assistant", "content": "We also covered hobbies in general terms."},
+                    {"role": "user", "content": "Rachel signed up for music classes last week."},
+                ],
+            ],
+            "haystack_session_ids": ["sess_uke", "sess_music"],
+            "haystack_dates": ["2024/02/10 (Sat) 09:00", "2024/02/10 (Sat) 09:00"],
+            "correct_session_ids": ["sess_uke"],
+        }
+    ]
+    dataset_path = tmp_path / "longmemeval.json"
+    dataset_path.write_text(json.dumps(dataset), encoding="utf-8")
+
+    report = evaluate_longmemeval(dataset_path, embedding_model=FakeEmbeddingModel(), mode="graph_raw")
+
+    assert report.r_at_5 == 1.0
+    assert report.per_case[0].retrieved_session_ids[0] == "sess_uke"
+
 def test_longmemeval_held_out_split(tmp_path):
     dataset_path = tmp_path / "longmemeval_split_test.json"
     # Create 100 items for easy splitting

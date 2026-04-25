@@ -40,7 +40,7 @@ That demo exercises the full MCP surface: graph ingestion, retrieval, conflict h
 
 ## Who It's For
 
-**→ Individual developer** extending Claude, Codex, Cursor, or Antigravity with persistent memory:
+**→ Individual developer** extending Claude, Codex, Gemini CLI, Cursor, or Antigravity with persistent memory:
 Use Python 3.11+ and install via `pipx` (no venv activation needed):
 `brew install pipx && pipx ensurepath && pipx install waggle-mcp && waggle-mcp setup --yes`.
 SQLite + local embeddings, zero infra.
@@ -70,7 +70,7 @@ Waggle often uses materially fewer tokens than naive chunked retrieval on factua
 
 ```mermaid
 flowchart LR
-  C["MCP Client\n(Claude/Cursor/Codex/Antigravity)"] --> S["waggle.server\nMCP tool surface"]
+  C["MCP Client\n(Claude/Gemini CLI/Codex/Cursor/Antigravity/ChatGPT)"] --> S["waggle.server\nMCP tool surface"]
   S --> G["Graph Engine\nMemoryGraph / Neo4jMemoryGraph"]
   G --> DB["SQLite (local default)\nor Neo4j (service mode)"]
   G --> E["Embeddings\n(sentence-transformers or deterministic fallback)"]
@@ -102,7 +102,7 @@ Running `setup --yes` detects local MCP clients, writes the necessary configurat
 
 For Codex, `waggle-mcp setup --yes` and `waggle-mcp init` also write a managed Waggle block into `AGENTS.md` in the current workspace so automatic memory is enabled by default for that repo.
 
-Manual MCP setup examples for **Codex**, **Claude Code**, **Cursor**, and **Antigravity** are in [docs/reference.md](./docs/reference.md#manual-client-configuration).
+Manual MCP setup examples for **Codex**, **Claude Code**, **Gemini CLI**, **Cursor**, and **Antigravity** are in [docs/reference.md](./docs/reference.md#manual-client-configuration).
 
 Comprehensive live feature run (full tool surface, multi-query graph tests, export/import validation):
 [`tests/artifacts/test-run/comprehensive_feature_demo.md`](./tests/artifacts/test-run/comprehensive_feature_demo.md)
@@ -145,11 +145,45 @@ Use this shared JSON config shape for clients that accept `mcpServers` JSON (rec
 > To skip the download entirely, set `"WAGGLE_MODEL": "deterministic"` (offline-safe, instant start, slightly lower retrieval quality).
 
 <details>
-<summary>Claude Desktop / Antigravity / Cursor / Claude Code setup details</summary>
+<summary>Claude Desktop / Gemini CLI / Antigravity / Cursor / Claude Code setup details</summary>
 
 **Claude Desktop config file location**
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+**Gemini CLI**
+```bash
+gemini mcp add waggle \
+  -e WAGGLE_TRANSPORT=stdio \
+  -e WAGGLE_BACKEND=sqlite \
+  -e WAGGLE_DB_PATH=~/.waggle/memory.db \
+  -e WAGGLE_DEFAULT_TENANT_ID=local-default \
+  -e WAGGLE_MODEL=all-MiniLM-L6-v2 \
+  waggle-mcp serve
+```
+
+Equivalent `~/.gemini/settings.json` entry:
+
+```json
+{
+  "mcpServers": {
+    "waggle": {
+      "command": "waggle-mcp",
+      "args": ["serve"],
+      "env": {
+        "WAGGLE_TRANSPORT": "stdio",
+        "WAGGLE_BACKEND": "sqlite",
+        "WAGGLE_DB_PATH": "~/.waggle/memory.db",
+        "WAGGLE_DEFAULT_TENANT_ID": "local-default",
+        "WAGGLE_MODEL": "all-MiniLM-L6-v2"
+      },
+      "trust": false
+    }
+  }
+}
+```
+
+After restarting Gemini CLI, run `/mcp` to confirm Waggle is connected.
 
 **Antigravity**
 - The **AI agent** reads: `~/.gemini/antigravity/mcp_config.json` (macOS/Linux) or `%USERPROFILE%\.gemini\antigravity\mcp_config.json` (Windows)
@@ -195,6 +229,36 @@ env     = {
 ```
 
 A live-source development example is included in [codex_config.example.toml](./codex_config.example.toml).
+
+### ChatGPT
+
+ChatGPT custom MCP connectors use a remote HTTPS MCP server, not a local `stdio` process. To connect Waggle to ChatGPT, deploy Waggle in HTTP mode, expose the `/mcp` endpoint over HTTPS, then add that URL as a custom connector in ChatGPT.
+
+For a service deployment, use the Neo4j backend:
+
+```bash
+WAGGLE_TRANSPORT=http \
+WAGGLE_BACKEND=neo4j \
+WAGGLE_DEFAULT_TENANT_ID=workspace-default \
+WAGGLE_NEO4J_URI=bolt://localhost:7687 \
+WAGGLE_NEO4J_USERNAME=neo4j \
+WAGGLE_NEO4J_PASSWORD=change-me \
+waggle-mcp serve
+```
+
+Then configure ChatGPT with the HTTPS endpoint:
+
+```text
+https://waggle.example.com/mcp
+```
+
+In ChatGPT, enable developer mode and add the connector from:
+
+```text
+Settings -> Connectors -> Advanced -> Developer mode
+```
+
+Do not expose Waggle publicly without authentication. A remote memory server can read and mutate project memory, so it should sit behind your normal auth, network allowlisting, or gateway controls.
 
 ### `waggle-mcp` not on PATH?
 

@@ -223,7 +223,7 @@ After Waggle is installed as an MCP server, the normal workflow is conversationa
 - Work in a normal Codex thread.
 - Codex can use `observe_conversation`, `store_node`, `store_edge`, `query_graph`, and `prime_context` to persist and retrieve memory.
 - Later tasks can recover connected graph context even when the original thread is no longer in the current window.
-- `waggle-mcp init` writes that Codex rule to `AGENTS.md` in the current workspace by default. If you configure Waggle manually, add a Codex instruction/rule telling the agent to call `prime_context` at session start, `query_graph` before context-dependent answers, and `observe_conversation` after durable turns.
+- `waggle-mcp setup --yes` and `waggle-mcp init` write that Codex rule to `AGENTS.md` in the current workspace by default. If you configure Waggle manually, add a Codex instruction/rule telling the agent to call `prime_context` at session start, `query_graph` before context-dependent answers, and `observe_conversation` after durable turns.
 
 ### Claude Code
 

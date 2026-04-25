@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from hashlib import sha256
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -33,6 +34,13 @@ class PreparedLongMemEvalSession:
     updated_at: datetime
 
 
+@dataclass(frozen=True)
+class PreparedLongMemEvalChunk:
+    session_id: str
+    chunk_id: str
+    content: str
+
+
 @dataclass
 class PreparedLongMemEvalEntry:
     query_id: str
@@ -40,6 +48,7 @@ class PreparedLongMemEvalEntry:
     correct_session_ids: list[str]
     sessions: list[PreparedLongMemEvalSession]
     embedding_matrix: np.ndarray
+    chunks: list[PreparedLongMemEvalChunk]
 
 
 @dataclass
@@ -57,6 +66,7 @@ class LongMemEvalReport:
     per_case: list[LongMemEvalCaseResult]
     split_type: str = "full"
     split_seed: int | None = None
+    profile: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -73,6 +83,34 @@ class LongMemEvalReport:
             "r_at_5": self.r_at_5,
             "exact_at_5": self.exact_at_5,
             "per_case": [asdict(case) for case in self.per_case],
+            "profile": self.profile,
+        }
+
+
+@dataclass
+class LongMemEvalProfile:
+    cache_lookup_seconds: float = 0.0
+    prepare_seconds: float = 0.0
+    query_embed_seconds: float = 0.0
+    raw_rank_seconds: float = 0.0
+    hybrid_rank_seconds: float = 0.0
+    case_total_seconds: float = 0.0
+    cases_profiled: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        cases = max(self.cases_profiled, 1)
+        return {
+            "cases_profiled": self.cases_profiled,
+            "cache_lookup_seconds": self.cache_lookup_seconds,
+            "prepare_seconds": self.prepare_seconds,
+            "query_embed_seconds": self.query_embed_seconds,
+            "raw_rank_seconds": self.raw_rank_seconds,
+            "hybrid_rank_seconds": self.hybrid_rank_seconds,
+            "case_total_seconds": self.case_total_seconds,
+            "avg_query_embed_seconds": self.query_embed_seconds / cases,
+            "avg_raw_rank_seconds": self.raw_rank_seconds / cases,
+            "avg_hybrid_rank_seconds": self.hybrid_rank_seconds / cases,
+            "avg_case_total_seconds": self.case_total_seconds / cases,
         }
 
 
@@ -80,6 +118,88 @@ class LongMemEvalReport:
 class PreparedLongMemEvalCache:
     prepared_entries: list[PreparedLongMemEvalEntry]
     question_embeddings: np.ndarray
+
+
+def _normalized_question_terms(question: str) -> list[str]:
+    return [
+        token
+        for token in "".join(character.lower() if character.isalnum() else " " for character in question).split()
+        if len(token) > 2
+    ]
+
+
+def _quoted_phrase_score(question: str, content: str) -> float:
+    lowered_content = content.lower()
+    phrases = []
+    for quote in ("'", '"'):
+        parts = question.split(quote)
+        phrases.extend(parts[index].strip().lower() for index in range(1, len(parts), 2))
+    if not phrases:
+        return 0.0
+    matches = sum(1 for phrase in phrases if len(phrase) >= 3 and phrase in lowered_content)
+    return matches / len(phrases)
+
+
+def _term_coverage_score(question: str, content: str) -> float:
+    terms = _normalized_question_terms(question)
+    if not terms:
+        return 0.0
+    lowered_content = content.lower()
+    hits = sum(1 for term in terms if term in lowered_content)
+    return hits / len(terms)
+
+
+def _temporal_alignment_scores(question: str, sessions: list[PreparedLongMemEvalSession]) -> np.ndarray:
+    temporal_hints = infer_temporal_hints(question)
+    temporal_scores = np.zeros(len(sessions), dtype=np.float32)
+    if temporal_hints.recency_mode == "default" or not sessions:
+        return temporal_scores
+    timestamps = np.asarray([session.updated_at.timestamp() for session in sessions], dtype=np.float64)
+    max_timestamp = float(np.max(timestamps))
+    min_timestamp = float(np.min(timestamps))
+    span = max(max_timestamp - min_timestamp, 1.0)
+    if temporal_hints.recency_mode == "latest":
+        temporal_scores = np.asarray((timestamps - min_timestamp) / span, dtype=np.float32)
+    elif temporal_hints.recency_mode == "oldest":
+        temporal_scores = np.asarray((max_timestamp - timestamps) / span, dtype=np.float32)
+    return temporal_scores
+
+
+def _combined_candidate_scores(
+    question: str,
+    entry: PreparedLongMemEvalEntry,
+    question_embedding: np.ndarray,
+    embedding_model: Any,
+    *,
+    semantic_weight: float,
+    lexical_weight: float,
+    temporal_weight: float,
+    coverage_weight: float,
+    quoted_weight: float,
+) -> np.ndarray:
+    semantic_scores = _vector_similarity_matrix(question_embedding, entry, embedding_model)
+    if semantic_scores.size == 0:
+        return np.empty(0, dtype=np.float32)
+    lexical_scores = np.asarray(
+        [lexical_overlap(question, session.label, session.content) for session in entry.sessions],
+        dtype=np.float32,
+    )
+    temporal_scores = _temporal_alignment_scores(question, entry.sessions)
+    coverage_scores = np.asarray(
+        [_term_coverage_score(question, session.content) for session in entry.sessions],
+        dtype=np.float32,
+    )
+    quoted_scores = np.asarray(
+        [_quoted_phrase_score(question, session.content) for session in entry.sessions],
+        dtype=np.float32,
+    )
+    return (
+        (semantic_weight * semantic_scores)
+        + (lexical_weight * lexical_scores)
+        + (temporal_weight * temporal_scores)
+        + (coverage_weight * coverage_scores)
+        + (quoted_weight * quoted_scores)
+    )
 
 
 def _dataset_sha256(dataset_path: str | Path) -> str:
@@ -172,22 +292,83 @@ def _embed_texts_in_chunks(embedding_model: Any, texts: list[str], *, chunk_size
 
 
 def _rank_candidates_heuristic(question: str, sessions: list[PreparedLongMemEvalSession], *, top_k: int) -> list[PreparedLongMemEvalSession]:
-    temporal_hints = infer_temporal_hints(question)
-    max_timestamp = max((session.updated_at.timestamp() for session in sessions), default=1.0)
-    min_timestamp = min((session.updated_at.timestamp() for session in sessions), default=0.0)
-    span = max(max_timestamp - min_timestamp, 1.0)
+    temporal_scores = _temporal_alignment_scores(question, sessions)
     scored: list[tuple[float, int, PreparedLongMemEvalSession]] = []
     for index, session in enumerate(sessions):
         base_score = 1.0 / (index + 1)
         lexical_score = lexical_overlap(question, session.label, session.content)
-        temporal_score = 0.0
-        if temporal_hints.recency_mode == "latest":
-            temporal_score = (session.updated_at.timestamp() - min_timestamp) / span
-        elif temporal_hints.recency_mode == "oldest":
-            temporal_score = (max_timestamp - session.updated_at.timestamp()) / span
-        score = (0.5 * base_score) + (0.35 * lexical_score) + (0.15 * temporal_score)
+        temporal_score = float(temporal_scores[index]) if len(temporal_scores) > index else 0.0
+        coverage_score = _term_coverage_score(question, session.content)
+        quoted_score = _quoted_phrase_score(question, session.content)
+        score = (
+            (0.35 * base_score)
+            + (0.25 * lexical_score)
+            + (0.15 * temporal_score)
+            + (0.20 * coverage_score)
+            + (0.05 * quoted_score)
+        )
         scored.append((score, -index, session))
     return [item[2] for item in sorted(scored, key=lambda item: (-item[0], item[1]))[:top_k]]
+
+
+def _session_chunks(session: PreparedLongMemEvalSession) -> list[PreparedLongMemEvalChunk]:
+    lines = [line.strip() for line in session.content.splitlines() if line.strip()]
+    if not lines:
+        return []
+    if len(lines) == 1:
+        return [PreparedLongMemEvalChunk(session_id=session.session_id, chunk_id=f"{session.session_id}:0", content=lines[0])]
+    chunks: list[PreparedLongMemEvalChunk] = [
+        PreparedLongMemEvalChunk(
+            session_id=session.session_id,
+            chunk_id=f"{session.session_id}:full",
+            content=session.content,
+        )
+    ]
+    for index, line in enumerate(lines):
+        chunks.append(
+            PreparedLongMemEvalChunk(
+                session_id=session.session_id,
+                chunk_id=f"{session.session_id}:line:{index}",
+                content=line,
+            )
+        )
+    return chunks[:5]
+
+
+def _chunk_rerank_sessions(
+    question: str,
+    sessions: list[PreparedLongMemEvalSession],
+    *,
+    top_k: int,
+) -> list[PreparedLongMemEvalSession]:
+    if not sessions:
+        return []
+    chunk_pool: list[PreparedLongMemEvalChunk] = []
+    for session in sessions:
+        for chunk in _session_chunks(session):
+            chunk_pool.append(chunk)
+    if not chunk_pool:
+        return sessions[:top_k]
+
+    chunk_scores: dict[str, float] = {}
+    for chunk in chunk_pool:
+        lexical = lexical_overlap(question, chunk.session_id, chunk.content)
+        coverage = _term_coverage_score(question, chunk.content)
+        quoted = _quoted_phrase_score(question, chunk.content)
+        score = (0.45 * lexical) + (0.45 * coverage) + (0.10 * quoted)
+        previous = chunk_scores.get(chunk.session_id, 0.0)
+        if score > previous:
+            chunk_scores[chunk.session_id] = score
+
+    ranked = sorted(
+        sessions,
+        key=lambda session: (
+            -chunk_scores.get(session.session_id, 0.0),
+            -session.updated_at.timestamp(),
+            session.session_id,
+        ),
+    )
+    return ranked[:top_k]
 
 
 def _prepare_entry_specs(entry: dict[str, Any], *, mode: str) -> tuple[str, str, list[str], list[PreparedLongMemEvalSession]]:
@@ -220,17 +401,20 @@ def _prepare_entries(entries: list[dict[str, Any]], *, mode: str, embedding_mode
     entry_specs = [_prepare_entry_specs(entry, mode=mode) for entry in entries]
     unique_texts: list[str] = []
     seen_texts: set[str] = set()
+    entry_chunks: list[list[PreparedLongMemEvalChunk]] = []
     for _, _, _, sessions in entry_specs:
         for session in sessions:
             if session.content not in seen_texts:
                 seen_texts.add(session.content)
                 unique_texts.append(session.content)
+        chunks = [chunk for session in sessions for chunk in _session_chunks(session)]
+        entry_chunks.append(chunks)
     embedding_cache: dict[str, np.ndarray] = {}
     if unique_texts:
         for text, embedding in zip(unique_texts, _embed_texts_in_chunks(embedding_model, unique_texts), strict=True):
             embedding_cache[text] = embedding
     prepared_entries: list[PreparedLongMemEvalEntry] = []
-    for query_id, question, correct_session_ids, sessions in entry_specs:
+    for (query_id, question, correct_session_ids, sessions), chunks in zip(entry_specs, entry_chunks, strict=True):
         if sessions:
             embedding_matrix = np.asarray([embedding_cache[session.content] for session in sessions], dtype=np.float32)
         else:
@@ -242,6 +426,7 @@ def _prepare_entries(entries: list[dict[str, Any]], *, mode: str, embedding_mode
                 correct_session_ids=correct_session_ids,
                 sessions=sessions,
                 embedding_matrix=embedding_matrix,
+                chunks=chunks,
             )
         )
     return prepared_entries
@@ -320,6 +505,14 @@ def _serialize_prepared_entries(prepared_entries: list[PreparedLongMemEvalEntry]
                     }
                     for session in entry.sessions
                 ],
+                "chunks": [
+                    {
+                        "session_id": chunk.session_id,
+                        "chunk_id": chunk.chunk_id,
+                        "content": chunk.content,
+                    }
+                    for chunk in entry.chunks
+                ],
             }
         )
     return payload, arrays
@@ -337,6 +530,14 @@ def _deserialize_prepared_entries(payload: list[dict[str, Any]], arrays: Any) ->
             )
             for session in entry.get("sessions", [])
         ]
+        chunks = [
+            PreparedLongMemEvalChunk(
+                session_id=str(chunk["session_id"]),
+                chunk_id=str(chunk["chunk_id"]),
+                content=str(chunk["content"]),
+            )
+            for chunk in entry.get("chunks", [])
+        ]
         prepared_entries.append(
             PreparedLongMemEvalEntry(
                 query_id=str(entry["query_id"]),
@@ -344,6 +545,7 @@ def _deserialize_prepared_entries(payload: list[dict[str, Any]], arrays: Any) ->
                 correct_session_ids=[str(item) for item in entry.get("correct_session_ids", [])],
                 sessions=sessions,
                 embedding_matrix=np.asarray(arrays[str(entry["embedding_key"])], dtype=np.float32),
+                chunks=chunks,
             )
         )
     return prepared_entries
@@ -353,6 +555,8 @@ def _load_prepared_cache(metadata_path: Path, arrays_path: Path) -> PreparedLong
     if not metadata_path.exists() or not arrays_path.exists():
         return None
     payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if int(payload.get("schema_version", 1)) < 3:
+        return None
     with np.load(arrays_path, allow_pickle=False) as arrays:
         prepared_entries = _deserialize_prepared_entries(payload.get("prepared_entries", []), arrays)
         question_embeddings = np.asarray(arrays[str(payload["question_embeddings_key"])], dtype=np.float32)
@@ -376,7 +580,7 @@ def _save_prepared_cache(
     metadata_path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 3,
                 "format": "waggle-longmemeval-cache",
                 "prepared_entries": prepared_payload,
                 "question_embeddings_key": question_embeddings_key,
@@ -400,28 +604,75 @@ def _vector_similarity_matrix(question_embedding: np.ndarray, entry: PreparedLon
     )
 
 
+def _chunk_session_scores(question: str, entry: PreparedLongMemEvalEntry) -> dict[str, float]:
+    if not entry.chunks:
+        return {}
+    scores: dict[str, float] = {}
+    for chunk in entry.chunks:
+        lexical_score = lexical_overlap(question, chunk.chunk_id, chunk.content)
+        coverage_score = _term_coverage_score(question, chunk.content)
+        quoted_score = _quoted_phrase_score(question, chunk.content)
+        combined = (0.45 * lexical_score) + (0.45 * coverage_score) + (0.10 * quoted_score)
+        previous = scores.get(chunk.session_id, 0.0)
+        if combined > previous:
+            scores[chunk.session_id] = combined
+    return scores
+
+
 def _raw_candidate_order(question: str, entry: PreparedLongMemEvalEntry, question_embedding: np.ndarray, embedding_model: Any) -> list[PreparedLongMemEvalSession]:
-    semantic_scores = _vector_similarity_matrix(question_embedding, entry, embedding_model)
-    if semantic_scores.size == 0:
+    session_scores = _combined_candidate_scores(
+        question,
+        entry,
+        question_embedding,
+        embedding_model,
+        semantic_weight=0.60,
+        lexical_weight=0.15,
+        temporal_weight=0.10,
+        coverage_weight=0.10,
+        quoted_weight=0.05,
+    )
+    if session_scores.size == 0:
         return []
-    lexical_scores = np.asarray(
-        [lexical_overlap(question, session.label, session.content) for session in entry.sessions],
+    chunk_scores = _chunk_session_scores(question, entry)
+    fused_scores = np.asarray(
+        [
+            max(
+                float(session_score),
+                0.9 * chunk_scores.get(session.session_id, 0.0),
+            )
+            for session, session_score in zip(entry.sessions, session_scores, strict=True)
+        ],
         dtype=np.float32,
     )
-    temporal_hints = infer_temporal_hints(question)
-    temporal_scores = np.zeros(len(entry.sessions), dtype=np.float32)
-    if temporal_hints.recency_mode != "default":
-        timestamps = np.asarray([session.updated_at.timestamp() for session in entry.sessions], dtype=np.float64)
-        max_timestamp = float(np.max(timestamps))
-        min_timestamp = float(np.min(timestamps))
-        span = max(max_timestamp - min_timestamp, 1.0)
-        if temporal_hints.recency_mode == "latest":
-            temporal_scores = np.asarray((timestamps - min_timestamp) / span, dtype=np.float32)
-        elif temporal_hints.recency_mode == "oldest":
-            temporal_scores = np.asarray((max_timestamp - timestamps) / span, dtype=np.float32)
-    combined_scores = (0.72 * semantic_scores) + (0.18 * lexical_scores) + (0.10 * temporal_scores)
-    ranked_indices = np.argsort(-combined_scores, kind="stable")
+    ranked_indices = np.argsort(-fused_scores, kind="stable")
     return [entry.sessions[index] for index in ranked_indices]
+
+
+def _hybrid_candidate_order(question: str, entry: PreparedLongMemEvalEntry, question_embedding: np.ndarray, embedding_model: Any) -> list[PreparedLongMemEvalSession]:
+    first_pass = _raw_candidate_order(question, entry, question_embedding, embedding_model)
+    if not first_pass:
+        return []
+    top_candidates = first_pass[:10]
+    heuristic_reranked = _rank_candidates_heuristic(question, top_candidates, top_k=min(20, len(top_candidates)))
+    chunk_reranked = _chunk_rerank_sessions(
+        question,
+        top_candidates,
+        top_k=min(20, len(top_candidates)),
+    )
+    raw_rank = {session.session_id: index for index, session in enumerate(first_pass[:20], start=1)}
+    heuristic_rank = {session.session_id: index for index, session in enumerate(heuristic_reranked, start=1)}
+    chunk_rank = {session.session_id: index for index, session in enumerate(chunk_reranked, start=1)}
+    fused_scores: list[tuple[float, int, PreparedLongMemEvalSession]] = []
+    rrf_k = 20.0
+    for index, session in enumerate(first_pass[:20], start=1):
+        score = (
+            (1.0 / (rrf_k + index))
+            + (0.45 / (rrf_k + heuristic_rank.get(session.session_id, 1000)))
+            + (0.75 / (rrf_k + chunk_rank.get(session.session_id, 1000)))
+        )
+        fused_scores.append((score, -raw_rank[session.session_id], session))
+    ordered = [item[2] for item in sorted(fused_scores, key=lambda item: (-item[0], item[1]))]
+    return ordered[:5]
 
 
 def evaluate_longmemeval(
@@ -434,7 +685,9 @@ def evaluate_longmemeval(
     cache_dir: str | Path | None = None,
     split_type: str = "full",
     split_seed: int | None = None,
+    profile: bool = False,
 ) -> LongMemEvalReport:
+    profiler = LongMemEvalProfile() if profile else None
     if entries is None:
         entries = _load_entries(dataset_path)
     
@@ -464,18 +717,24 @@ def evaluate_longmemeval(
         cache_key=full_cache_key,
         cache_dir=cache_dir,
     )
+    cache_lookup_started = time.perf_counter()
     cached = _load_prepared_cache(cache_metadata_path, cache_arrays_path)
+    if profiler is not None:
+        profiler.cache_lookup_seconds += time.perf_counter() - cache_lookup_started
     if cached is not None:
         cache_status = "warm"
         prepared_entries = cached.prepared_entries
         question_embeddings = cached.question_embeddings
     else:
         cache_status = "cold"
+        prepare_started = time.perf_counter()
         prepared_entries = _prepare_entries(entries, mode=mode, embedding_model=model_instance)
         question_embeddings = _embed_texts_in_chunks(
             model_instance,
             [prepared_entry.question for prepared_entry in prepared_entries],
         )
+        if profiler is not None:
+            profiler.prepare_seconds += time.perf_counter() - prepare_started
         # Only save cache if we are evaluating the full dataset or at least a large chunk
         if limit is None and split_type == "full":
             _save_prepared_cache(
@@ -514,12 +773,22 @@ def evaluate_longmemeval(
         zip(entries, prepared_entries, question_embeddings, strict=True),
         start=1,
     ):
+        case_started = time.perf_counter()
         question = prepared_entry.question
-        ranked_candidates = _raw_candidate_order(question, prepared_entry, question_embedding, model_instance)
+        query_embed_started = time.perf_counter()
+        question_vector = np.asarray(question_embedding, dtype=np.float32)
+        if profiler is not None:
+            profiler.query_embed_seconds += time.perf_counter() - query_embed_started
         if mode == "graph_raw":
-            ranked_sessions = ranked_candidates[:5]
+            raw_rank_started = time.perf_counter()
+            ranked_sessions = _raw_candidate_order(question, prepared_entry, question_vector, model_instance)[:5]
+            if profiler is not None:
+                profiler.raw_rank_seconds += time.perf_counter() - raw_rank_started
         else:
-            ranked_sessions = _rank_candidates_heuristic(question, ranked_candidates[:20], top_k=5)
+            hybrid_rank_started = time.perf_counter()
+            ranked_sessions = _hybrid_candidate_order(question, prepared_entry, question_vector, model_instance)
+            if profiler is not None:
+                profiler.hybrid_rank_seconds += time.perf_counter() - hybrid_rank_started
         retrieved_session_ids = [session.session_id for session in ranked_sessions]
         gold_ids = prepared_entry.correct_session_ids
         retrieved_set = set(retrieved_session_ids[:5])
@@ -534,6 +803,9 @@ def evaluate_longmemeval(
                 exact_at_5=gold_set.issubset(retrieved_set),
             )
         )
+        if profiler is not None:
+            profiler.case_total_seconds += time.perf_counter() - case_started
+            profiler.cases_profiled += 1
     case_count = len(results)
     prepared_session_count = sum(len(entry.sessions) for entry in prepared_entries)
     hit_rate = sum(1 if result.hit_at_5 else 0 for result in results) / case_count if case_count else 0.0
@@ -552,6 +824,7 @@ def evaluate_longmemeval(
         r_at_5=hit_rate,
         exact_at_5=exact_rate,
         per_case=results,
+        profile=profiler.to_dict() if profiler is not None else None,
     )
 
 
@@ -570,6 +843,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--held-out", action="store_true", help="Split into 50 dev / 450 test based on fixed seed.")
     parser.add_argument("--split-seed", type=int, default=42, help="Seed for dev/test split.")
+    parser.add_argument("--profile", action="store_true", help="Capture coarse timing for benchmark phases.")
     return parser
 
 
@@ -605,6 +879,7 @@ def main(argv: list[str] | None = None) -> int:
             cache_dir=args.cache_dir,
             split_type="dev",
             split_seed=args.split_seed,
+            profile=args.profile,
         )
         
         test_report = evaluate_longmemeval(
@@ -615,6 +890,7 @@ def main(argv: list[str] | None = None) -> int:
             cache_dir=args.cache_dir,
             split_type="test",
             split_seed=args.split_seed,
+            profile=args.profile,
         )
         
         print("=" * 72)
@@ -639,6 +915,7 @@ def main(argv: list[str] | None = None) -> int:
         mode=args.mode,
         limit=args.limit,
         cache_dir=args.cache_dir,
+        profile=args.profile,
     )
     print("=" * 72)
     print("waggle LongMemEval exploratory benchmark")
@@ -652,6 +929,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cache: cold (wrote {report.cache_path})")
     print(f"R@5: {report.r_at_5:.1%}")
     print(f"Exact@5: {report.exact_at_5:.1%}")
+    if report.profile:
+        print(f"profile: {json.dumps(report.profile, sort_keys=True)}")
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")

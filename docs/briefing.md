@@ -43,4 +43,3 @@ Waggle is a local-first MCP memory layer that stores conversation as a persisten
 - Transcript handoff tests cover ingest, deduplication, extraction, and export behavior
 - Smoke test exercises live `store_node`, `query_graph`, and `graph://stats`
 - Checked-in benchmark artifacts document retrieval quality and token use
-

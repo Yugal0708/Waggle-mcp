@@ -60,6 +60,8 @@ from waggle.models import (
     ConnectedNodeStat,
     ContextBundleExportResult,
     ContextScopeResult,
+    ContextWindow,
+    ContextWindowEdge,
     ContextTimelineItem,
     Edge,
     EvidenceRecord,
@@ -562,6 +564,160 @@ class Neo4jMemoryGraph:
             if node is None:
                 raise ValueError(f"Node not found: {node_id}")
             return node
+
+    def ensure_repo(self, project: str = "") -> str:
+        del project
+        return "default"
+
+    def ensure_context_window(self, session_id: str = "", repo_id: str | None = None) -> str:
+        del repo_id
+        return session_id.strip() or "default"
+
+    def resolve_window_context(self, project: str | None = None, session_id: str | None = None) -> tuple[str, str]:
+        return (self.ensure_repo(project or "default"), self.ensure_context_window(session_id or "default", "default"))
+
+    def list_context_windows(
+        self,
+        *,
+        project: str = "",
+        status: str = "",
+        limit: int = 20,
+    ) -> list[ContextWindow]:
+        del project, status, limit
+        return []
+
+    def get_context_window(self, window_id: str) -> ContextWindow:
+        return ContextWindow(
+            id=window_id,
+            tenant_id=self.tenant_id,
+            repo_id="default",
+            session_id=window_id,
+            title="",
+            status="active",
+            node_count=0,
+        )
+
+    def get_context_window_edges(self, window_id: str) -> list[ContextWindowEdge]:
+        del window_id
+        return []
+
+    def close_context_window(self, window_id: str) -> ContextWindow:
+        window = self.get_context_window(window_id)
+        window.status = "closed"
+        window.closed_at = utc_now()
+        window.updated_at = window.closed_at
+        return window
+
+    def get_repo_windows(
+        self,
+        repo_id: str,
+        *,
+        exclude: str | None = None,
+        include_archived: bool = False,
+    ) -> list[ContextWindow]:
+        del repo_id, exclude, include_archived
+        return []
+
+    def get_window_nodes(self, window_id: str, node_types: list[NodeType] | None = None) -> list[Node]:
+        del window_id, node_types
+        return []
+
+    def compute_window_embedding(self, window_id: str) -> np.ndarray | None:
+        del window_id
+        return None
+
+    def get_window_embedding(self, window_id: str) -> np.ndarray | None:
+        del window_id
+        return None
+
+    def extract_window_entities(self, window_id: str) -> list[dict[str, str]]:
+        del window_id
+        return []
+
+    def derive_context_window_edges(self, window_id: str, repo_id: str) -> list[ContextWindowEdge]:
+        del window_id, repo_id
+        return []
+
+    def get_nodes_without_window(self) -> list[Node]:
+        return []
+
+    def assign_nodes_to_window(self, node_ids: list[str], window_id: str) -> int:
+        del node_ids, window_id
+        return 0
+
+    def list_repos(self) -> list[dict[str, Any]]:
+        return []
+
+    def update_window_node_count(self, window_id: str) -> int:
+        del window_id
+        return 0
+
+    def mark_window_embedding_stale(self, window_id: str) -> None:
+        del window_id
+
+    def tiered_query(
+        self,
+        *,
+        query: str,
+        project: str = "",
+        repo_id: str | None = None,
+        max_nodes: int = 20,
+        max_depth: int = 2,
+        top_k_windows: int | None = None,
+    ) -> SubgraphResult:
+        del repo_id, top_k_windows
+        result = self.query(query=query, project=project, max_nodes=max_nodes, max_depth=max_depth)
+        result.retrieval_mode = "flat_fallback"
+        return result
+
+    def debug_retrieval(
+        self,
+        *,
+        query: str,
+        project: str = "",
+        agent_id: str = "",
+        session_id: str = "",
+        max_nodes: int = 10,
+        max_depth: int = 2,
+    ) -> dict[str, Any]:
+        result = self.query(
+            query=query,
+            project=project,
+            agent_id=agent_id,
+            session_id=session_id,
+            max_nodes=max_nodes,
+            max_depth=max_depth,
+        )
+        return {
+            "query": query.strip(),
+            "repo_id": "default",
+            "project": project,
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "retrieval_mode": "flat_fallback",
+            "embedding_preview": [],
+            "windows_evaluated": 0,
+            "all_windows": [],
+            "selected_windows": [],
+            "flat_top_nodes": [
+                {
+                    "node_id": node.id,
+                    "label": node.label,
+                    "node_type": node.node_type.value,
+                    "project": node.project,
+                    "session_id": node.session_id,
+                    "context_window_id": node.context_window_id,
+                    "similarity_score": node.similarity_score,
+                    "recency_score": node.recency_score,
+                    "edge_score": node.edge_score,
+                    "final_score": node.final_score,
+                    "updated_at": node.updated_at.isoformat(),
+                }
+                for node in result.nodes[:max_nodes]
+            ],
+            "tiered_top_nodes": [],
+            "tiered_result_mode": "flat_fallback",
+        }
 
     def query(
         self,
@@ -1196,6 +1352,27 @@ class Neo4jMemoryGraph:
                 arrows="to",
             )
         destination.write_text(network.generate_html(notebook=False), encoding="utf-8")
+        return destination
+
+    def export_window_graph_html(
+        self,
+        *,
+        project: str = "",
+        output_path: str | Path | None = None,
+        include_physics: bool = True,
+    ) -> Path:
+        del project, include_physics
+        if output_path is None:
+            self.export_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = utc_now().strftime("%Y%m%d-%H%M%S")
+            destination = self.export_dir / f"waggle-window-graph-{timestamp}.html"
+        else:
+            destination = Path(output_path).expanduser()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            "<!doctype html><html><body><p>Neo4j context-window graph visualization is not implemented yet.</p></body></html>",
+            encoding="utf-8",
+        )
         return destination
 
     def export_graph_backup(self, *, output_path: str | Path | None = None) -> BackupResult:
