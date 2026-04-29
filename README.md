@@ -398,6 +398,8 @@ Waggle includes a built-in CLI for setup, maintenance, and learning the memory s
 | `waggle-mcp setup --yes` | Non-interactive one-line setup that auto-patches detected supported clients. |
 | `waggle-mcp init` | Interactive setup wizard to configure one MCP client. |
 | `waggle-mcp serve` | Run the MCP server (usually started automatically by your client). |
+| `waggle-mcp edit-graph` | Launch the local Graph Studio in the browser for direct graph editing and export/import workflows. |
+| `waggle-mcp benchmark-oolong` | Run OOLONG retrieval or retrieval+LLM evaluation against local datasets and emit a JSON report. |
 | `waggle-mcp ingest-transcript-handoff` | Ingest a rollover transcript and export a handoff bundle for the next window or IDE. |
 | `waggle-mcp export-context-bundle` | Export a portable Markdown/JSON context pack for another AI. |
 | `waggle-mcp export-markdown-vault` | Export your memory graph as an Obsidian-style vault. |
@@ -418,6 +420,24 @@ For advanced commands (tenant management, API keys, Neo4j migration), see the fu
 ```bash
 waggle-mcp --help
 ```
+
+### Graph Studio
+
+Waggle includes a local browser-based graph editor for inspecting and editing memory directly.
+
+```bash
+waggle-mcp edit-graph
+```
+
+Graph Studio currently supports:
+
+- Direct node and edge editing in the browser
+- Mouse-based node dragging and shift-drag edge creation
+- Collapsible side panels, focus mode, and label toggling for large graphs
+- Live graph stats including connected nodes, isolates, and cluster count
+- Export/import of the current graph, including `.abhi` sharing workflows
+
+Use this when you want to inspect the live memory graph visually, clean up relationships, or export a portable memory artifact for another Waggle instance.
 
 ---
 
