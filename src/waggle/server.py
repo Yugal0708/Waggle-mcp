@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import getpass
 import json
 import logging
 import os
@@ -13,6 +15,7 @@ import time
 import uuid
 import webbrowser
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -28,9 +31,10 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
 
 from waggle import __version__
-from waggle.abhi import build_abhi_document, execute_abhi_query, validate_abhi_document
+from waggle.abhi import abhi_to_snapshot, build_abhi_document, execute_abhi_query, load_abhi_document, validate_abhi_document
 from waggle.config import AppConfig, STARTUP_MODE_FAST, STARTUP_MODE_STRICT
 from waggle.embeddings import EmbeddingModel, EMBEDDING_FREE_TOOLS, STATUS_READY, STATUS_DISABLED
 from waggle.errors import (
@@ -60,6 +64,9 @@ from waggle.models import (
     ContextScopeResult,
     ContextWindow,
     ContextWindowEdge,
+    DrivePullResult,
+    DrivePushResult,
+    DriveShareResult,
     GraphDiffResult,
     GraphStats,
     MarkdownVaultExportResult,
@@ -100,6 +107,26 @@ from waggle.serializer import (
 )
 
 LOGGER = logging.getLogger(__name__)
+_DRIVE_SYNC_IMPORT_ERROR: Exception | None = None
+
+try:
+    from waggle.drive_sync import (
+        download_drive_file,
+        ensure_drive_credentials,
+        merge_downloaded_abhi,
+        push_file_to_drive,
+        resolve_drive_file_id,
+        share_drive_file,
+    )
+except Exception as exc:  # pragma: no cover - depends on optional Google libs
+    download_drive_file = None
+    ensure_drive_credentials = None
+    merge_downloaded_abhi = None
+    push_file_to_drive = None
+    resolve_drive_file_id = None
+    share_drive_file = None
+    _DRIVE_SYNC_IMPORT_ERROR = exc
+
 WRITE_HEAVY_TOOLS = {
     "store_node",
     "store_edge",
@@ -131,6 +158,120 @@ REQUIRED_RUNTIME_METHODS = (
     "resolve_conflict",
 )
 
+_EXPORT_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("OpenAI-style API key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
+    ("Anthropic API key", re.compile(r"\bsk-ant-[A-Za-z0-9\-_]{20,}\b")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b")),
+    ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("JWT token", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]{8,}\.[A-Za-z0-9._-]{8,}\b")),
+    ("Password assignment", re.compile(r"(?i)\b(password|passwd|pwd)\b\s*[:=]\s*['\"]?\S+")),
+    ("Secret/token assignment", re.compile(r"(?i)\b(api[_ -]?key|secret[_ -]?key|access[_ -]?token)\b\s*[:=]\s*['\"]?\S+")),
+)
+
+
+def _resolve_passphrase(args: argparse.Namespace) -> str:
+    env_name = str(getattr(args, "passphrase_env", "") or "").strip()
+    if env_name:
+        return os.environ.get(env_name, "").strip()
+    if bool(getattr(args, "encrypt", False)):
+        return getpass.getpass("ABHI passphrase: ").strip()
+    return ""
+
+
+def _resolve_drive_token_path(args: argparse.Namespace, config: AppConfig) -> Path:
+    raw = str(getattr(args, "token_path", "") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    export_root = Path(config.export_dir).expanduser() if config.export_dir else Path.home() / ".waggle"
+    return export_root / "google-drive-token.json"
+
+
+def _require_drive_sync() -> None:
+    if _DRIVE_SYNC_IMPORT_ERROR is None:
+        return
+    raise ValidationFailure(
+        "Google Drive sync requires optional Google API dependencies in the active environment. "
+        f"Original import error: {_DRIVE_SYNC_IMPORT_ERROR}"
+    )
+
+
+def _scan_export_transcripts_for_secrets(
+    backend: MemoryGraph,
+    *,
+    project: str = "",
+    agent_id: str = "",
+    session_id: str = "",
+    scope: str = "all",
+    since_date: str = "",
+    max_findings: int = 10,
+) -> list[dict[str, Any]]:
+    snapshot = backend.get_graph_snapshot()
+    document = build_abhi_document(
+        snapshot,
+        scope=scope,
+        project=project,
+        agent_id=agent_id,
+        session_id=session_id,
+        since_date=since_date,
+        include_embeddings=False,
+        encrypted=False,
+    )
+    findings: list[dict[str, Any]] = []
+    for row in document.get("transcripts", []):
+        text = str(row.get("transcript_text", ""))
+        if not text.strip():
+            continue
+        for label, pattern in _EXPORT_SECRET_PATTERNS:
+            match = pattern.search(text)
+            if match is None:
+                continue
+            secret = match.group(0)
+            preview = text.replace(secret, "[REDACTED]")
+            findings.append(
+                {
+                    "pattern": label,
+                    "transcript_id": str(row.get("id", "")),
+                    "session_id": str(row.get("session_id", "")),
+                    "turn_index": int(row.get("turn_index", 0) or 0),
+                    "role": str(row.get("role", "")),
+                    "preview": preview[:180],
+                }
+            )
+            break
+        if len(findings) >= max_findings:
+            break
+    return findings
+
+
+def _assert_export_safe(
+    backend: MemoryGraph,
+    *,
+    force: bool,
+    project: str = "",
+    agent_id: str = "",
+    session_id: str = "",
+    scope: str = "all",
+    since_date: str = "",
+) -> None:
+    findings = _scan_export_transcripts_for_secrets(
+        backend,
+        project=project,
+        agent_id=agent_id,
+        session_id=session_id,
+        scope=scope,
+        since_date=since_date,
+    )
+    if findings and not force:
+        summary = "; ".join(
+            f"{item['pattern']} in {item['role']} turn {item['turn_index']} of session {item['session_id'] or 'default'}"
+            for item in findings[:3]
+        )
+        raise ValidationFailure(
+            "Export refused because transcript_records appear to contain secrets. "
+            f"Run again with --force only after redacting or confirming the export scope is safe. Findings: {summary}."
+        )
+
 MEMORY_AUTOMATION_POLICY = """Waggle automatic memory policy
 
 The user should not manually manage memory. The assistant/runtime is responsible for using Waggle tools.
@@ -139,7 +280,7 @@ Waggle should remember relevant conversational context automatically. If memory 
 Before answering:
 - Use prime_context at the start of a new session when project, agent, or session scope is known.
 - Use query_graph before answering questions that may depend on prior decisions, preferences, constraints, project state, or earlier conversation context.
-- Keep retrieval narrow: start with max_nodes 8-12, max_depth 1-2, retrieval_mode graph. Use fusion only when transcript replay is needed.
+- Keep retrieval narrow: start with max_nodes 8-12, max_depth 1-2, retrieval_mode hybrid. Use graph only when transcript evidence is not needed.
 
 After answering:
 - Use observe_conversation after completed turns that contain durable information: decisions, preferences, constraints, requirements, user corrections, project facts, or meaningful task outcomes.
@@ -235,6 +376,7 @@ def _build_backend(config: AppConfig) -> Any:
             recency_half_life_days=config.recency_half_life_days,
             tiered_retrieval=config.tiered_retrieval,
             tiered_retrieval_top_k_windows=config.tiered_retrieval_top_k_windows,
+            hybrid_retrieval_config=config.hybrid_retrieval_config(),
             export_dir=config.export_dir,
         )
     from waggle.neo4j_graph import Neo4jMemoryGraph
@@ -416,9 +558,9 @@ class WaggleServer:
                         **_scope_properties(),
                         "retrieval_mode": {
                             "type": "string",
-                            "enum": ["graph", "replay", "fusion"],
-                            "default": "graph",
-                            "description": "Retrieval strategy: graph-only, transcript replay, or fused graph plus replay results.",
+                            "enum": ["graph", "verbatim", "hybrid"],
+                            "default": "hybrid",
+                            "description": "Retrieval strategy: graph-only, verbatim transcript retrieval, or hybrid fusion with reranking.",
                         },
                     },
                     required=["query"],
@@ -444,6 +586,12 @@ class WaggleServer:
                             "default": 2,
                             "minimum": 0,
                             "description": "Relationship traversal depth for the flat retrieval comparison.",
+                        },
+                        "retrieval_mode": {
+                            "type": "string",
+                            "enum": ["graph", "verbatim", "hybrid"],
+                            "default": "hybrid",
+                            "description": "Which retrieval stack to diagnose.",
                         },
                         **_scope_properties(),
                     },
@@ -798,6 +946,11 @@ class WaggleServer:
                             "type": "string",
                             "description": "Optional destination .abhi file path. If omitted, Waggle chooses an export path.",
                         },
+                        "force": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Override the secret-scan refusal if transcript records contain likely secrets. Use only after deliberate review.",
+                        },
                         **_scope_properties(),
                     }
                 ),
@@ -835,9 +988,9 @@ class WaggleServer:
                         },
                         "retrieval_mode": {
                             "type": "string",
-                            "enum": ["graph", "replay", "fusion"],
-                            "default": "graph",
-                            "description": "Retrieval strategy for query mode: graph-only, transcript replay, or fused results.",
+                            "enum": ["graph", "verbatim", "hybrid"],
+                            "default": "hybrid",
+                            "description": "Retrieval strategy for query mode: graph-only, verbatim transcript retrieval, or hybrid fusion.",
                         },
                         "format": {
                             "type": "string",
@@ -920,7 +1073,7 @@ class WaggleServer:
                         "output_path": {"type": "string", "description": "Destination path for the merged .abhi file."},
                         "merge_strategy": {
                             "type": "string",
-                            "enum": ["prefer_right", "prefer_left"],
+                            "enum": ["prefer_right", "prefer_left", "last_write_wins"],
                             "default": "prefer_right",
                             "description": "Winner strategy when both sides changed the same object differently.",
                         },
@@ -1172,12 +1325,12 @@ class WaggleServer:
             return None
         # Best-effort: if the tool supports retrieval_mode, try replay fallback.
         retrieval_mode = arguments.get("retrieval_mode", "") if name in ("query_graph", "export_context_bundle") else ""
-        if retrieval_mode in ("replay", "lexical"):
+        if retrieval_mode in ("verbatim", "lexical"):
             return None  # let it through — no embeddings needed
         return self._tool_result(
             f"Tool '{name}' requires semantic embeddings which are unavailable in fast/inspection mode "
             f"(WAGGLE_STARTUP_MODE={self.config.startup_mode}). "
-            "Use retrieval_mode='replay' for transcript-only retrieval, or restart with "
+            "Use retrieval_mode='verbatim' for transcript-only retrieval, or restart with "
             "WAGGLE_STARTUP_MODE=normal.",
             {
                 "status": "unavailable",
@@ -1301,7 +1454,7 @@ class WaggleServer:
                         agent_id=arguments.get("agent_id", ""),
                         project=arguments.get("project", ""),
                         session_id=arguments.get("session_id", ""),
-                        retrieval_mode=arguments.get("retrieval_mode", "graph"),
+                        retrieval_mode=arguments.get("retrieval_mode", "hybrid"),
                     )
                     result = self._tool_result(
                         serialize_subgraph(subgraph),
@@ -1315,6 +1468,7 @@ class WaggleServer:
                         agent_id=arguments.get("agent_id", ""),
                         project=arguments.get("project", ""),
                         session_id=arguments.get("session_id", ""),
+                        retrieval_mode=arguments.get("retrieval_mode", "hybrid"),
                     )
                     result = self._tool_result(
                         json.dumps(debug, indent=2),
@@ -1492,6 +1646,13 @@ class WaggleServer:
                         },
                     )
                 elif name == "export_abhi":
+                    _assert_export_safe(
+                        graph,
+                        force=bool(arguments.get("force", False)),
+                        project=arguments.get("project", ""),
+                        agent_id=arguments.get("agent_id", ""),
+                        session_id=arguments.get("session_id", ""),
+                    )
                     exported = graph.export_abhi(
                         output_path=arguments.get("output_path"),
                         project=arguments.get("project", ""),
@@ -1519,7 +1680,7 @@ class WaggleServer:
                         session_id=arguments.get("session_id", ""),
                         max_nodes=int(arguments.get("max_nodes", 25)),
                         max_depth=int(arguments.get("max_depth", 2)),
-                        retrieval_mode=arguments.get("retrieval_mode", "graph"),
+                        retrieval_mode=arguments.get("retrieval_mode", "hybrid"),
                         format=arguments.get("format", "both"),
                         output_path=arguments.get("output_path"),
                         include_edges=bool(arguments.get("include_edges", True)),
@@ -1761,6 +1922,19 @@ class WaggleServer:
                     "turn_index": hit.turn_index,
                 }
                 for hit in result.fusion_hits
+            ],
+            "hybrid_hits": [
+                {
+                    "content": hit.content,
+                    "score": hit.score,
+                    "source": hit.source,
+                    "turn_pair_id": hit.turn_pair_id,
+                    "node_ids": hit.node_ids,
+                    "reasoning_from_reranker": hit.reasoning_from_reranker,
+                    "observed_at": hit.observed_at.isoformat() if hit.observed_at is not None else None,
+                    "layer_scores": hit.layer_scores,
+                }
+                for hit in result.hybrid_hits
             ],
         }
 
@@ -2260,16 +2434,36 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
             "created_at": current.get("created_at", now),
         }
 
+    def _json_safe_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+        safe = deepcopy(snapshot)
+        for node in safe.get("nodes", []):
+            node.pop("embedding", None)
+        for transcript in safe.get("transcripts", []):
+            transcript.pop("embedding", None)
+        return safe
+
     async def graph_editor(request: Request) -> Response:
         mode = request.query_params.get("mode", "edit").strip().lower()
         if mode not in {"edit", "view"}:
             mode = "edit"
-        return HTMLResponse(render_graph_editor_html(mode=mode))
+        scope = _scope_from_request(request)
+        return HTMLResponse(
+            render_graph_editor_html(
+                mode=mode,
+                project=scope["project"],
+                agent_id=scope["agent_id"],
+                session_id=scope["session_id"],
+            )
+        )
 
     async def graph_snapshot(request: Request) -> Response:
         scope = _scope_from_request(request)
         graph = app_server.graph
-        snapshot = graph.get_graph_snapshot(**scope)
+        include_source_prompt = request.query_params.get("include_source_prompt", "").strip().lower() in {"1", "true", "yes"}
+        try:
+            snapshot = graph.get_graph_snapshot(include_source_prompt=include_source_prompt, **scope)
+        except TypeError:
+            snapshot = graph.get_graph_snapshot(**scope)
         return JSONResponse(
             {
                 "tenant_id": snapshot.get("tenant_id", ""),
@@ -2279,6 +2473,87 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
                 "ui": snapshot.get("ui", {}),
                 "node_types": [node_type.value for node_type in NodeType],
                 "relation_types": [relation.value for relation in RelationType],
+            }
+        )
+
+    async def graph_transcripts(request: Request) -> Response:
+        scope = _scope_from_request(request)
+        limit = int(request.query_params.get("limit", "200") or "200")
+        query_text = request.query_params.get("query", "").strip()
+        graph = app_server.graph
+        if query_text and hasattr(graph, "search_transcript_records"):
+            hits = graph.search_transcript_records(query=query_text, limit=limit, **scope)
+            return JSONResponse(
+                {
+                    "mode": "hybrid",
+                    "query": query_text,
+                    "hits": [hit.model_dump(mode="json") for hit in hits],
+                }
+            )
+        if not hasattr(graph, "list_transcript_records"):
+            raise ValidationFailure("Transcript listing is not available in this backend.")
+        records = graph.list_transcript_records(limit=limit, **scope)
+        return JSONResponse(
+            {
+                "mode": "chronological",
+                "records": [record.model_dump(mode="json") for record in records],
+            }
+        )
+
+    async def graph_retrieval_debug(request: Request) -> Response:
+        payload = await request.json()
+        scope = {
+            "project": str(payload.get("project", "")).strip(),
+            "agent_id": str(payload.get("agent_id", "")).strip(),
+            "session_id": str(payload.get("session_id", "")).strip(),
+        }
+        query_text = str(payload.get("query", "")).strip()
+        if not query_text:
+            raise ValidationFailure("query is required.")
+        max_nodes = int(payload.get("max_nodes", 8) or 8)
+        max_depth = int(payload.get("max_depth", 1) or 1)
+        graph = app_server.graph
+        debug = graph.debug_retrieval(query=query_text, max_nodes=max_nodes, max_depth=max_depth, retrieval_mode="hybrid", **scope)
+        fusion = graph.query(
+            query=query_text,
+            retrieval_mode="hybrid",
+            max_nodes=max_nodes,
+            max_depth=max_depth,
+            **scope,
+        )
+        token_estimate = sum(max(1, len((hit.content if hasattr(hit, "content") else "") or "").split()) for hit in fusion.fusion_hits) * 1.33
+        fused_ranking: list[dict[str, Any]] = []
+        for hit in fusion.fusion_hits:
+            reasoning: list[str] = []
+            if hit.source_lane == "graph":
+                reasoning.append("semantic graph node")
+            if hit.graph_rank is not None:
+                reasoning.append(f"graph rank {hit.graph_rank}")
+            if hit.replay_rank is not None:
+                reasoning.append(f"replay rank {hit.replay_rank}")
+            if hit.session_id:
+                reasoning.append(f"session {hit.session_id}")
+            fused_ranking.append(
+                {
+                    "content": hit.content,
+                    "score": hit.score,
+                    "source_lane": hit.source_lane,
+                    "graph_rank": hit.graph_rank,
+                    "replay_rank": hit.replay_rank,
+                    "fused_rank": hit.fused_rank,
+                    "node_id": hit.node_id,
+                    "session_id": hit.session_id,
+                    "turn_index": hit.turn_index,
+                    "transcript_snippet": hit.transcript_snippet,
+                    "reasoning": ", ".join(reasoning) or "ranked by reciprocal-rank fusion",
+                }
+            )
+        return JSONResponse(
+            {
+                "debug": debug,
+                "replay_hits": [hit.model_dump(mode="json") for hit in fusion.replay_hits],
+                "fusion_hits": fused_ranking,
+                "token_estimate": int(token_estimate),
             }
         )
 
@@ -2344,6 +2619,104 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         )
         return JSONResponse(saved)
 
+    async def graph_restore(request: Request) -> Response:
+        payload = await request.json()
+        scope = {
+            "project": str(payload.get("project", "")).strip(),
+            "agent_id": str(payload.get("agent_id", "")).strip(),
+            "session_id": str(payload.get("session_id", "")).strip(),
+        }
+        graph = app_server.graph
+        current = graph.get_graph_snapshot(**scope)
+        desired_nodes = {
+            str(node.get("id", "")).strip(): node
+            for node in payload.get("nodes", [])
+            if str(node.get("id", "")).strip()
+        }
+        desired_edges = {
+            str(edge.get("id", "")).strip(): edge
+            for edge in payload.get("edges", [])
+            if str(edge.get("id", "")).strip()
+        }
+        current_nodes = {
+            str(node.get("id", "")).strip(): node
+            for node in current.get("nodes", [])
+            if str(node.get("id", "")).strip()
+        }
+        current_edges = {
+            str(edge.get("id", "")).strip(): edge
+            for edge in current.get("edges", [])
+            if str(edge.get("id", "")).strip()
+        }
+
+        for edge_id in list(current_edges):
+            if edge_id not in desired_edges:
+                graph.delete_edge(edge_id=edge_id)
+
+        for node_id in list(current_nodes):
+            if node_id not in desired_nodes:
+                graph.delete_node(node_id=node_id)
+
+        for node_id, node_payload in desired_nodes.items():
+            tags = [str(tag).strip() for tag in node_payload.get("tags", []) if str(tag).strip()]
+            if node_id in current_nodes:
+                graph.update_node(
+                    node_id=node_id,
+                    label=node_payload.get("label"),
+                    content=node_payload.get("content"),
+                    tags=tags,
+                )
+                continue
+            graph.add_node(
+                node_id=node_id,
+                label=str(node_payload.get("label", "")).strip(),
+                content=str(node_payload.get("content", "")).strip(),
+                node_type=NodeType(str(node_payload.get("node_type", "note")).strip() or "note"),
+                tags=tags,
+                agent_id=str(node_payload.get("agent_id", scope["agent_id"])).strip(),
+                project=str(node_payload.get("project", scope["project"])).strip(),
+                session_id=str(node_payload.get("session_id", scope["session_id"])).strip(),
+            )
+
+        for edge_id, edge_payload in desired_edges.items():
+            if edge_id in current_edges:
+                graph.update_edge(
+                    edge_id=edge_id,
+                    source_id=str(edge_payload.get("source_id", "")).strip() or None,
+                    target_id=str(edge_payload.get("target_id", "")).strip() or None,
+                    relationship=str(edge_payload.get("relationship", "")).strip() or None,
+                    weight=float(edge_payload["weight"]) if "weight" in edge_payload and edge_payload.get("weight") is not None else None,
+                )
+                continue
+            graph.add_edge(
+                edge_id=edge_id,
+                source_id=str(edge_payload.get("source_id", "")).strip(),
+                target_id=str(edge_payload.get("target_id", "")).strip(),
+                relationship=str(edge_payload.get("relationship", "")).strip(),
+                weight=float(edge_payload.get("weight", 1.0)),
+            )
+
+        ui = payload.get("ui", {}) or {}
+        saved = graph.save_ui_state(
+            project=scope["project"],
+            agent_id=scope["agent_id"],
+            session_id=scope["session_id"],
+            positions=ui.get("positions"),
+            zoom=float(ui["zoom"]) if "zoom" in ui and ui.get("zoom") is not None else None,
+            viewport=ui.get("viewport"),
+            groups=ui.get("groups"),
+            collapsed_groups=ui.get("collapsed_groups"),
+            selected_nodes=ui.get("selected_nodes"),
+        )
+        restored = graph.get_graph_snapshot(**scope)
+        return JSONResponse(
+            {
+                "nodes": restored.get("nodes", []),
+                "edges": restored.get("edges", []),
+                "ui": saved,
+            }
+        )
+
     async def graph_create_node(request: Request) -> Response:
         payload = await request.json()
         graph = app_server.graph
@@ -2356,6 +2729,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         snapshot["nodes"] = [*snapshot.get("nodes", []), _node_snapshot_payload(snapshot=snapshot, payload=payload)]
         _validate_live_snapshot(snapshot)
         created = graph.add_node(
+            node_id=str(payload.get("id", "")).strip() or None,
             label=str(payload.get("label", "")).strip(),
             content=str(payload.get("content", "")).strip(),
             node_type=NodeType(str(payload.get("node_type", "note")).strip() or "note"),
@@ -2402,6 +2776,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         snapshot["edges"] = [*snapshot.get("edges", []), _edge_snapshot_payload(snapshot=snapshot, payload=payload)]
         _validate_live_snapshot(snapshot)
         edge = graph.add_edge(
+            edge_id=str(payload.get("id", "")).strip() or None,
             source_id=str(payload.get("source_id", "")).strip(),
             target_id=str(payload.get("target_id", "")).strip(),
             relationship=str(payload.get("relationship", "")).strip(),
@@ -2445,10 +2820,10 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         graph = app_server.graph
         if export_format == "abhi":
             exported = graph.export_abhi(**scope)
-            content = Path(exported.output_path).read_text(encoding="utf-8")
+            content = Path(exported.output_path).read_bytes()
             return Response(
                 content,
-                media_type="application/json",
+                media_type="application/octet-stream",
                 headers={"Content-Disposition": 'attachment; filename="waggle-memory.abhi"'},
             )
         if export_format == "json":
@@ -2464,21 +2839,110 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         payload = await request.json()
         import_format = str(payload.get("format", "abhi")).strip().lower()
         content = str(payload.get("content", ""))
+        content_base64 = str(payload.get("content_base64", ""))
         suffix = ".abhi" if import_format == "abhi" else ".json"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
             temp_path = Path(handle.name)
         try:
-            temp_path.write_text(content, encoding="utf-8")
+            if import_format == "abhi" and content_base64:
+                temp_path.write_bytes(base64.b64decode(content_base64))
+            else:
+                temp_path.write_text(content, encoding="utf-8")
             graph = app_server.graph
+            imported_node_ids: list[str] = []
             if import_format == "abhi":
+                document = load_abhi_document(temp_path)
+                imported_node_ids = [str(node.get("id", "")).strip() for node in abhi_to_snapshot(document, fallback_tenant_id=graph.tenant_id).get("nodes", []) if str(node.get("id", "")).strip()]
                 imported = graph.import_abhi(input_path=temp_path)
             elif import_format == "json":
+                snapshot = json.loads(content)
+                imported_node_ids = [str(node.get("id", "")).strip() for node in snapshot.get("nodes", []) if str(node.get("id", "")).strip()]
                 imported = graph.import_graph_backup(input_path=temp_path)
             else:
                 raise ValidationFailure("format must be one of: abhi, json.")
-            return JSONResponse(imported.model_dump(mode="json"))
+            return JSONResponse({**imported.model_dump(mode="json"), "imported_node_ids": imported_node_ids})
         finally:
             temp_path.unlink(missing_ok=True)
+
+    async def graph_import_preview(request: Request) -> Response:
+        payload = await request.json()
+        import_format = str(payload.get("format", "abhi")).strip().lower()
+        content = str(payload.get("content", ""))
+        content_base64 = str(payload.get("content_base64", ""))
+        suffix = ".abhi" if import_format == "abhi" else ".json"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+            temp_path = Path(handle.name)
+        try:
+            if import_format == "abhi" and content_base64:
+                temp_path.write_bytes(base64.b64decode(content_base64))
+            else:
+                temp_path.write_text(content, encoding="utf-8")
+            graph = app_server.graph
+            if import_format == "abhi":
+                validation = graph.validate_abhi(input_path=temp_path)
+                inspect_result = graph.inspect_abhi(input_path=temp_path)
+                document = load_abhi_document(temp_path)
+                snapshot = abhi_to_snapshot(document, fallback_tenant_id=graph.tenant_id)
+                return JSONResponse(
+                    {
+                        "validation": validation.model_dump(mode="json"),
+                        "inspect": inspect_result.model_dump(mode="json"),
+                        "snapshot": {
+                            "tenant_id": snapshot.get("tenant_id", ""),
+                            "nodes": _json_safe_snapshot(snapshot).get("nodes", []),
+                            "edges": snapshot.get("edges", []),
+                            "ui": snapshot.get("ui", {}),
+                        },
+                        "imported_node_ids": [str(node.get("id", "")).strip() for node in snapshot.get("nodes", []) if str(node.get("id", "")).strip()],
+                    }
+                )
+            if import_format == "json":
+                snapshot = json.loads(content)
+                return JSONResponse(
+                    {
+                        "validation": {"valid": True, "errors": []},
+                        "inspect": {"node_count": len(snapshot.get("nodes", [])), "edge_count": len(snapshot.get("edges", []))},
+                        "snapshot": snapshot,
+                        "imported_node_ids": [str(node.get("id", "")).strip() for node in snapshot.get("nodes", []) if str(node.get("id", "")).strip()],
+                    }
+                )
+            raise ValidationFailure("format must be one of: abhi, json.")
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    async def graph_abhi_diff(request: Request) -> Response:
+        payload = await request.json()
+        content_a = str(payload.get("content_a", ""))
+        content_b = str(payload.get("content_b", ""))
+        content_a_base64 = str(payload.get("content_a_base64", ""))
+        content_b_base64 = str(payload.get("content_b_base64", ""))
+        with tempfile.NamedTemporaryFile(suffix=".abhi", delete=False) as handle_a:
+            path_a = Path(handle_a.name)
+        with tempfile.NamedTemporaryFile(suffix=".abhi", delete=False) as handle_b:
+            path_b = Path(handle_b.name)
+        try:
+            if content_a_base64:
+                path_a.write_bytes(base64.b64decode(content_a_base64))
+            else:
+                path_a.write_text(content_a, encoding="utf-8")
+            if content_b_base64:
+                path_b.write_bytes(base64.b64decode(content_b_base64))
+            else:
+                path_b.write_text(content_b, encoding="utf-8")
+            graph = app_server.graph
+            diff = graph.diff_abhi(input_path_a=path_a, input_path_b=path_b)
+            snapshot_a = abhi_to_snapshot(load_abhi_document(path_a), fallback_tenant_id=graph.tenant_id)
+            snapshot_b = abhi_to_snapshot(load_abhi_document(path_b), fallback_tenant_id=graph.tenant_id)
+            return JSONResponse(
+                {
+                    "diff": diff.model_dump(mode="json"),
+                    "left": {"nodes": _json_safe_snapshot(snapshot_a).get("nodes", []), "edges": snapshot_a.get("edges", [])},
+                    "right": {"nodes": _json_safe_snapshot(snapshot_b).get("nodes", []), "edges": snapshot_b.get("edges", [])},
+                }
+            )
+        finally:
+            path_a.unlink(missing_ok=True)
+            path_b.unlink(missing_ok=True)
 
     app = Starlette(
         routes=[
@@ -2487,10 +2951,15 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
             Route("/metrics", metrics_endpoint),
             Route("/graph", graph_editor),
             Route("/api/graph", graph_snapshot, methods=["GET"]),
+            Route("/api/graph/transcripts", graph_transcripts, methods=["GET"]),
+            Route("/api/graph/retrieval-debug", graph_retrieval_debug, methods=["POST"]),
             Route("/api/graph/abhi", graph_abhi_preview, methods=["GET"]),
+            Route("/api/graph/abhi/preview-import", graph_import_preview, methods=["POST"]),
+            Route("/api/graph/abhi/diff", graph_abhi_diff, methods=["POST"]),
             Route("/api/graph/query", graph_query, methods=["POST"]),
             Route("/api/graph/diff", graph_diff_feed, methods=["GET"]),
             Route("/api/graph/ui", graph_save_ui, methods=["PATCH"]),
+            Route("/api/graph/restore", graph_restore, methods=["POST"]),
             Route("/api/graph/nodes", graph_create_node, methods=["POST"]),
             Route("/api/graph/nodes/{node_id:str}", graph_update_node, methods=["PATCH"]),
             Route("/api/graph/nodes/{node_id:str}", graph_delete_node, methods=["DELETE"]),
@@ -2499,6 +2968,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
             Route("/api/graph/edges/{edge_id:str}", graph_delete_edge, methods=["DELETE"]),
             Route("/api/graph/export", graph_export, methods=["GET"]),
             Route("/api/graph/import", graph_import, methods=["POST"]),
+            Mount("/graph-assets", app=StaticFiles(packages=[("waggle", "static/graph")], html=False, check_dir=False)),
             Mount("/mcp", app=service.mcp_asgi),
         ],
         lifespan=service.lifespan,
@@ -2689,6 +3159,15 @@ def _build_parser() -> argparse.ArgumentParser:
     graph_viewer.add_argument("--port", type=int, default=8686)
     graph_viewer.add_argument("--open", action=argparse.BooleanOptionalAction, default=True)
 
+    graph_ui = subparsers.add_parser(
+        "ui",
+        help="Launch the local graph UI in the browser.",
+        description="Alias for edit-graph. Starts the localhost Graph Studio and opens it by default.",
+    )
+    graph_ui.add_argument("--host", default="127.0.0.1")
+    graph_ui.add_argument("--port", type=int, default=8686)
+    graph_ui.add_argument("--open", action=argparse.BooleanOptionalAction, default=True)
+
     create_tenant = subparsers.add_parser("create-tenant", help="Create or update a tenant record in the active backend.")
     create_tenant.add_argument("--tenant-id", required=True)
     create_tenant.add_argument("--name", default="")
@@ -2711,47 +3190,67 @@ def _build_parser() -> argparse.ArgumentParser:
         "export",
         help="Export the current memory graph in a portable format.",
     )
-    export_abhi.add_argument("--format", choices=["abhi"], default="abhi")
     export_abhi.add_argument("--output", dest="output_path", default=None)
     export_abhi.add_argument("--project", default="")
     export_abhi.add_argument("--agent-id", default="")
     export_abhi.add_argument("--session-id", default="")
+    export_abhi.add_argument("--scope", choices=["all", "project", "session", "since-date"], default="all")
+    export_abhi.add_argument("--since-date", default="")
+    export_abhi.add_argument("--include-embeddings", action=argparse.BooleanOptionalAction, default=True)
+    export_abhi.add_argument("--encrypt", action="store_true")
+    export_abhi.add_argument("--sign", action="store_true")
+    export_abhi.add_argument("--signing-key-dir", default="~/.waggle/keys")
+    export_abhi.add_argument("--redact", dest="redact_patterns", action="append", default=[])
+    export_abhi.add_argument("--passphrase-env", default="")
+    export_abhi.add_argument("--force", action="store_true", help="Export even if transcript secret scan finds likely credentials or tokens.")
 
     import_abhi = subparsers.add_parser(
         "import",
         help="Import a portable memory file into the active backend.",
     )
-    import_abhi.add_argument("--format", choices=["abhi"], default="abhi")
-    import_abhi.add_argument("--input", dest="input_path", required=True)
+    import_abhi.add_argument("input_path", nargs="?")
+    import_abhi.add_argument("--input", dest="input_path_flag", default="")
+    import_abhi.add_argument("--namespace", default="")
+    import_abhi.add_argument("--merge-strategy", choices=["skip-existing", "overwrite", "branch"], default="skip-existing")
+    import_abhi.add_argument("--verify-signature", action="store_true")
+    import_abhi.add_argument("--read-only", action="store_true")
+    import_abhi.add_argument("--reembed-on-mismatch", action="store_true")
+    import_abhi.add_argument("--passphrase-env", default="")
 
     validate_abhi = subparsers.add_parser(
         "validate",
         help="Validate a portable .abhi memory file.",
     )
     validate_abhi.add_argument("--input", dest="input_path", required=True)
+    validate_abhi.add_argument("--passphrase-env", default="")
 
     inspect_abhi = subparsers.add_parser(
         "inspect",
         help="Inspect an .abhi memory file without importing it.",
     )
     inspect_abhi.add_argument("--input", dest="input_path", required=True)
+    inspect_abhi.add_argument("--passphrase-env", default="")
 
     diff_abhi = subparsers.add_parser(
         "diff",
         help="Compare two .abhi memory files.",
     )
-    diff_abhi.add_argument("--file-a", dest="input_path_a", required=True)
-    diff_abhi.add_argument("--file-b", dest="input_path_b", required=True)
+    diff_abhi.add_argument("input_path_a", nargs="?")
+    diff_abhi.add_argument("input_path_b", nargs="?")
+    diff_abhi.add_argument("--file-a", dest="input_path_a_flag", default="")
+    diff_abhi.add_argument("--file-b", dest="input_path_b_flag", default="")
 
     merge_abhi = subparsers.add_parser(
         "merge",
         help="Three-way merge .abhi memory files.",
     )
-    merge_abhi.add_argument("--base", dest="base_input_path", required=True)
-    merge_abhi.add_argument("--left", dest="left_input_path", required=True)
-    merge_abhi.add_argument("--right", dest="right_input_path", required=True)
+    merge_abhi.add_argument("left_input_path", nargs="?")
+    merge_abhi.add_argument("right_input_path", nargs="?")
+    merge_abhi.add_argument("--base", dest="base_input_path", default="")
+    merge_abhi.add_argument("--left", dest="left_input_path_flag", default="")
+    merge_abhi.add_argument("--right", dest="right_input_path_flag", default="")
     merge_abhi.add_argument("--output", dest="output_path", required=True)
-    merge_abhi.add_argument("--merge-strategy", choices=["prefer_right", "prefer_left"], default="prefer_right")
+    merge_abhi.add_argument("--merge-strategy", choices=["prefer_right", "prefer_left", "last_write_wins"], default="prefer_right")
 
     query_abhi = subparsers.add_parser(
         "query",
@@ -2760,6 +3259,7 @@ def _build_parser() -> argparse.ArgumentParser:
     query_abhi.add_argument("--input", dest="input_path", required=True)
     query_abhi.add_argument("--query-id", default="")
     query_abhi.add_argument("--query-text", default="")
+    query_abhi.add_argument("--passphrase-env", default="")
 
     load_abhi_chunks = subparsers.add_parser(
         "load-chunks",
@@ -2769,6 +3269,56 @@ def _build_parser() -> argparse.ArgumentParser:
     load_abhi_chunks.add_argument("--chunk-id", dest="chunk_ids", action="append", default=[])
     load_abhi_chunks.add_argument("--query-id", default="")
     load_abhi_chunks.add_argument("--query-text", default="")
+    load_abhi_chunks.add_argument("--passphrase-env", default="")
+
+    push_abhi = subparsers.add_parser(
+        "push",
+        help="Export the current graph to .abhi and upload it to Google Drive.",
+    )
+    push_abhi.add_argument("--drive", action="store_true")
+    push_abhi.add_argument("--output", dest="output_path", default=None)
+    push_abhi.add_argument("--project", default="")
+    push_abhi.add_argument("--agent-id", default="")
+    push_abhi.add_argument("--session-id", default="")
+    push_abhi.add_argument("--scope", choices=["all", "project", "session", "since-date"], default="all")
+    push_abhi.add_argument("--since-date", default="")
+    push_abhi.add_argument("--include-embeddings", action=argparse.BooleanOptionalAction, default=True)
+    push_abhi.add_argument("--encrypt", action=argparse.BooleanOptionalAction, default=True)
+    push_abhi.add_argument("--passphrase-env", default="")
+    push_abhi.add_argument("--force", action="store_true", help="Export/upload even if transcript secret scan finds likely credentials or tokens.")
+    push_abhi.add_argument("--folder-id", default="")
+    push_abhi.add_argument("--remote-name", default="")
+    push_abhi.add_argument("--client-secret-path", default="~/.waggle/google-client-secret.json")
+    push_abhi.add_argument("--token-path", default="")
+    push_abhi.add_argument("--open-browser", action=argparse.BooleanOptionalAction, default=True)
+
+    pull_abhi = subparsers.add_parser(
+        "pull",
+        help="Download a Google Drive .abhi file and merge it into the current graph.",
+    )
+    pull_abhi.add_argument("file_ref")
+    pull_abhi.add_argument("--folder-id", default="")
+    pull_abhi.add_argument("--download-path", default="")
+    pull_abhi.add_argument("--merged-output", default="")
+    pull_abhi.add_argument("--passphrase-env", default="")
+    pull_abhi.add_argument("--client-secret-path", default="~/.waggle/google-client-secret.json")
+    pull_abhi.add_argument("--token-path", default="")
+    pull_abhi.add_argument("--open-browser", action=argparse.BooleanOptionalAction, default=True)
+    pull_abhi.add_argument("--namespace", default="")
+    pull_abhi.add_argument("--merge-strategy", choices=["skip-existing", "overwrite", "branch"], default="skip-existing")
+    pull_abhi.add_argument("--verify-signature", action="store_true")
+    pull_abhi.add_argument("--read-only", action="store_true")
+    pull_abhi.add_argument("--reembed-on-mismatch", action="store_true")
+
+    share_abhi = subparsers.add_parser(
+        "share",
+        help="Create an anyone-with-link share URL for a Google Drive file.",
+    )
+    share_abhi.add_argument("file_ref")
+    share_abhi.add_argument("--folder-id", default="")
+    share_abhi.add_argument("--client-secret-path", default="~/.waggle/google-client-secret.json")
+    share_abhi.add_argument("--token-path", default="")
+    share_abhi.add_argument("--open-browser", action=argparse.BooleanOptionalAction, default=True)
 
     benchmark_oolong = subparsers.add_parser(
         "benchmark-oolong",
@@ -2788,7 +3338,7 @@ def _build_parser() -> argparse.ArgumentParser:
     benchmark_oolong.add_argument("--llm-api-key-env", default="GROQ_API_KEY")
     benchmark_oolong.add_argument("--llm-max-tokens", type=int, default=512)
     benchmark_oolong.add_argument("--llm-timeout-seconds", type=float, default=60.0)
-    benchmark_oolong.add_argument("--retrieval-mode", choices=["graph", "fusion", "replay", "aggregate"], default="graph")
+    benchmark_oolong.add_argument("--retrieval-mode", choices=["graph", "hybrid", "verbatim", "aggregate"], default="graph")
     benchmark_oolong.add_argument("--max-nodes", type=int, default=8)
     benchmark_oolong.add_argument("--max-depth", type=int, default=1)
     benchmark_oolong.add_argument("--chunk-lines", type=int, default=12)
@@ -2814,7 +3364,7 @@ def _build_parser() -> argparse.ArgumentParser:
     export_context_bundle.add_argument("--session-id", default="")
     export_context_bundle.add_argument("--max-nodes", type=int, default=25)
     export_context_bundle.add_argument("--max-depth", type=int, default=2)
-    export_context_bundle.add_argument("--retrieval-mode", choices=["graph", "replay", "fusion"], default="graph")
+    export_context_bundle.add_argument("--retrieval-mode", choices=["graph", "verbatim", "hybrid"], default="graph")
     export_context_bundle.add_argument("--format", choices=["markdown", "json", "both"], default="both")
     export_context_bundle.add_argument("--output-path", default=None)
     export_context_bundle.add_argument("--include-edges", action=argparse.BooleanOptionalAction, default=True)
@@ -2928,7 +3478,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Explain the main tools, graph workflows, and how connected context reaches the model.",
         description="Print a detailed guide to the waggle-mcp feature surface.",
     )
-    subparsers.add_parser(
+    doctor = subparsers.add_parser(
         "doctor",
         help="Check your Waggle installation: config files, embedding model status, DB path, and common mistakes.",
         description=(
@@ -2937,6 +3487,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "WAGGLE_STARTUP_MODE, stdout encoding (Windows), and known API gotchas."
         ),
     )
+    doctor.add_argument("--fix", action="store_true", help="Re-embed stale transcript/node rows to the current model ID.")
     return parser
 
 
@@ -2989,39 +3540,64 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
         temp_path.unlink(missing_ok=True)
         return 0
     if args.command == "export":
-        if args.format != "abhi":
-            raise ValidationFailure(f"Unsupported export format: {args.format}")
+        _assert_export_safe(
+            backend,
+            force=bool(getattr(args, "force", False)),
+            project=getattr(args, "project", ""),
+            agent_id=getattr(args, "agent_id", ""),
+            session_id=getattr(args, "session_id", ""),
+            scope=getattr(args, "scope", "all"),
+            since_date=getattr(args, "since_date", ""),
+        )
         exported = backend.export_abhi(
             output_path=args.output_path,
             project=getattr(args, "project", ""),
             agent_id=getattr(args, "agent_id", ""),
             session_id=getattr(args, "session_id", ""),
+            scope=getattr(args, "scope", "all"),
+            since_date=getattr(args, "since_date", ""),
+            include_embeddings=bool(getattr(args, "include_embeddings", True)),
+            passphrase=_resolve_passphrase(args),
+            redact_patterns=list(getattr(args, "redact_patterns", []) or []),
+            sign=bool(getattr(args, "sign", False)),
+            signing_key_dir=getattr(args, "signing_key_dir", "~/.waggle/keys"),
         )
         print(json.dumps(exported.model_dump(mode="json"), indent=2))
         return 0
     if args.command == "import":
-        if args.format != "abhi":
-            raise ValidationFailure(f"Unsupported import format: {args.format}")
-        imported = backend.import_abhi(input_path=args.input_path)
+        input_path = getattr(args, "input_path", None) or getattr(args, "input_path_flag", "")
+        imported = backend.import_abhi(
+            input_path=input_path,
+            passphrase=_resolve_passphrase(args),
+            namespace=getattr(args, "namespace", ""),
+            merge_strategy=getattr(args, "merge_strategy", "skip-existing"),
+            verify_signature=bool(getattr(args, "verify_signature", False)),
+            read_only=bool(getattr(args, "read_only", False)),
+            reembed_on_mismatch=bool(getattr(args, "reembed_on_mismatch", False)),
+        )
         print(json.dumps(imported.model_dump(mode="json"), indent=2))
         return 0
     if args.command == "validate":
-        validation = backend.validate_abhi(input_path=args.input_path)
+        validation = backend.validate_abhi(input_path=args.input_path, passphrase=_resolve_passphrase(args))
         print(json.dumps(validation.model_dump(mode="json"), indent=2))
         return 0 if validation.valid else 1
     if args.command == "inspect":
-        inspected = backend.inspect_abhi(input_path=args.input_path)
+        inspected = backend.inspect_abhi(input_path=args.input_path, passphrase=_resolve_passphrase(args))
         print(json.dumps(inspected.model_dump(mode="json"), indent=2))
         return 0
     if args.command == "diff":
-        diff = backend.diff_abhi(input_path_a=args.input_path_a, input_path_b=args.input_path_b)
+        input_path_a = getattr(args, "input_path_a", None) or getattr(args, "input_path_a_flag", "")
+        input_path_b = getattr(args, "input_path_b", None) or getattr(args, "input_path_b_flag", "")
+        diff = backend.diff_abhi(input_path_a=input_path_a, input_path_b=input_path_b)
         print(json.dumps(diff.model_dump(mode="json"), indent=2))
         return 0
     if args.command == "merge":
+        left_input_path = getattr(args, "left_input_path_flag", "") or args.left_input_path
+        right_input_path = getattr(args, "right_input_path_flag", "") or args.right_input_path
         merged = backend.merge_abhi(
-            base_input_path=args.base_input_path,
-            left_input_path=args.left_input_path,
-            right_input_path=args.right_input_path,
+            base_input_path=args.base_input_path or left_input_path,
+            left_input_path=left_input_path,
+            right_input_path=right_input_path,
             output_path=args.output_path,
             merge_strategy=args.merge_strategy,
         )
@@ -3032,6 +3608,7 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
             input_path=args.input_path,
             query_id=getattr(args, "query_id", ""),
             query_text=getattr(args, "query_text", ""),
+            passphrase=_resolve_passphrase(args),
         )
         print(json.dumps(queried.model_dump(mode="json"), indent=2))
         return 0
@@ -3041,8 +3618,109 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
             chunk_ids=getattr(args, "chunk_ids", []),
             query_id=getattr(args, "query_id", ""),
             query_text=getattr(args, "query_text", ""),
+            passphrase=_resolve_passphrase(args),
         )
         print(json.dumps(loaded.model_dump(mode="json"), indent=2))
+        return 0
+    if args.command == "push":
+        _require_drive_sync()
+        passphrase = _resolve_passphrase(args)
+        _assert_export_safe(
+            backend,
+            force=bool(getattr(args, "force", False)),
+            project=getattr(args, "project", ""),
+            agent_id=getattr(args, "agent_id", ""),
+            session_id=getattr(args, "session_id", ""),
+            scope=getattr(args, "scope", "all"),
+            since_date=getattr(args, "since_date", ""),
+        )
+        exported = backend.export_abhi(
+            output_path=args.output_path,
+            project=getattr(args, "project", ""),
+            agent_id=getattr(args, "agent_id", ""),
+            session_id=getattr(args, "session_id", ""),
+            scope=getattr(args, "scope", "all"),
+            since_date=getattr(args, "since_date", ""),
+            include_embeddings=bool(getattr(args, "include_embeddings", True)),
+            passphrase=passphrase,
+        )
+        credentials = ensure_drive_credentials(
+            client_secret_path=args.client_secret_path,
+            token_path=_resolve_drive_token_path(args, config),
+            open_browser=bool(getattr(args, "open_browser", True)),
+        )
+        pushed = push_file_to_drive(
+            local_path=exported.output_path,
+            folder_id=str(getattr(args, "folder_id", "") or ""),
+            credentials=credentials,
+            remote_name=str(getattr(args, "remote_name", "") or ""),
+            encrypted=bool(passphrase),
+        )
+        print(json.dumps(pushed.model_dump(mode="json"), indent=2))
+        return 0
+    if args.command == "pull":
+        _require_drive_sync()
+        passphrase = _resolve_passphrase(args)
+        credentials = ensure_drive_credentials(
+            client_secret_path=args.client_secret_path,
+            token_path=_resolve_drive_token_path(args, config),
+            open_browser=bool(getattr(args, "open_browser", True)),
+        )
+        remote_file_id, remote_name = resolve_drive_file_id(
+            file_ref=args.file_ref,
+            credentials=credentials,
+            folder_id=str(getattr(args, "folder_id", "") or ""),
+        )
+        download_path = Path(getattr(args, "download_path", "") or backend.export_dir / f"{remote_file_id}.abhi")
+        _, resolved_name = download_drive_file(
+            file_id=remote_file_id,
+            destination_path=download_path,
+            credentials=credentials,
+        )
+        local_document = build_abhi_document(backend.get_graph_snapshot())
+        remote_document = load_abhi_document(download_path, passphrase=passphrase)
+        merged_output = Path(getattr(args, "merged_output", "") or backend.export_dir / f"merged-{remote_file_id}.abhi")
+        merged_path = merge_downloaded_abhi(
+            local_document=local_document,
+            remote_document=remote_document,
+            output_path=merged_output,
+        )
+        imported = backend.import_abhi(
+            input_path=merged_path,
+            passphrase=passphrase,
+            namespace=getattr(args, "namespace", ""),
+            merge_strategy=getattr(args, "merge_strategy", "skip-existing"),
+            verify_signature=bool(getattr(args, "verify_signature", False)),
+            read_only=bool(getattr(args, "read_only", False)),
+            reembed_on_mismatch=bool(getattr(args, "reembed_on_mismatch", False)),
+        )
+        result = DrivePullResult(
+            remote_file_id=remote_file_id,
+            remote_name=resolved_name or remote_name,
+            downloaded_path=str(download_path),
+            merged_output_path=merged_path,
+            merge_strategy="last_write_wins",
+            nodes_created=imported.nodes_created,
+            nodes_updated=imported.nodes_updated,
+            edges_created=imported.edges_created,
+            edges_updated=imported.edges_updated,
+        )
+        print(json.dumps(result.model_dump(mode="json"), indent=2))
+        return 0
+    if args.command == "share":
+        _require_drive_sync()
+        credentials = ensure_drive_credentials(
+            client_secret_path=args.client_secret_path,
+            token_path=_resolve_drive_token_path(args, config),
+            open_browser=bool(getattr(args, "open_browser", True)),
+        )
+        remote_file_id, _ = resolve_drive_file_id(
+            file_ref=args.file_ref,
+            credentials=credentials,
+            folder_id=str(getattr(args, "folder_id", "") or ""),
+        )
+        shared = share_drive_file(file_id=remote_file_id, credentials=credentials)
+        print(json.dumps(shared.model_dump(mode="json"), indent=2))
         return 0
     if args.command == "benchmark-oolong":
         llm_answerer = None
@@ -3154,7 +3832,7 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
         print(_FEATURES_GUIDE)
         return 0
     if args.command == "doctor":
-        return _run_doctor(config)
+        return _run_doctor(config, fix=bool(getattr(args, "fix", False)))
     raise ValidationFailure(f"Unknown command: {args.command}")
 
 
@@ -3194,7 +3872,7 @@ Known API gotchas (from the Waggle field error log):
 """
 
 
-def _run_doctor(config: AppConfig) -> int:
+def _run_doctor(config: AppConfig, *, fix: bool = False) -> int:
     """waggle-mcp doctor — surface configuration and environment issues."""
     issues: list[str] = []
     ok_items: list[str] = []
@@ -3293,7 +3971,32 @@ def _run_doctor(config: AppConfig) -> int:
             )
 
     # ── 4. WAGGLE_STARTUP_MODE ───────────────────────────────────────────────
-    print(_c(_BOLD, "\n[4] Startup mode"))
+    print(_c(_BOLD, "\n[4] Embedding store"))
+    graph = _default_graph(config)
+    if isinstance(graph, MemoryGraph):
+        store_health = graph.get_embedding_store_health()
+        if fix and (store_health["transcript_stale_rows"] or store_health["node_stale_rows"]):
+            repair = graph.reembed_stale_embeddings(batch_size=100)
+            _ok(
+                "Re-embedded stale rows: "
+                f"{repair['transcript_rows_updated']} transcript rows, {repair['node_rows_updated']} node rows."
+            )
+            store_health = graph.get_embedding_store_health()
+        transcript_models = store_health["transcript_model_counts"]
+        node_models = store_health["node_model_counts"]
+        print(f"  Current model id: {store_health['current_model_id']}")
+        print(f"  Transcript model ids: {transcript_models or '{}'}")
+        print(f"  Node model ids: {node_models or '{}'}")
+        print(f"  Stale transcript rows: {store_health['transcript_stale_rows']}")
+        print(f"  Stale node rows: {store_health['node_stale_rows']}")
+        if store_health["mixed_models"]:
+            issues.append("Mixed embedding_model_id values detected in the store.")
+            _fail("Mixed embedding model IDs detected across transcript_records/nodes.")
+        else:
+            _ok("Store model IDs are consistent.")
+
+    # ── 5. WAGGLE_STARTUP_MODE ───────────────────────────────────────────────
+    print(_c(_BOLD, "\n[5] Startup mode"))
     print(f"  WAGGLE_STARTUP_MODE = {config.startup_mode!r}")
     if config.is_fast_mode:
         _ok("fast mode: zero ML overhead. Schema/tool listing only. Semantic tools return 'unavailable'.")
@@ -3302,9 +4005,9 @@ def _run_doctor(config: AppConfig) -> int:
     else:
         _ok("normal mode: embedding loads in background. First semantic call may wait up to ~30 s.")
 
-    # ── 5. Windows stdout encoding ───────────────────────────────────────────
+    # ── 6. Windows stdout encoding ───────────────────────────────────────────
     if sys.platform == "win32":
-        print(_c(_BOLD, "\n[5] Windows stdout encoding"))
+        print(_c(_BOLD, "\n[6] Windows stdout encoding"))
         enc = getattr(sys.stdout, "encoding", "unknown")
         if enc.lower().replace("-", "") in ("utf8", "utf8"):
             _ok(f"stdout encoding: {enc}")
@@ -3317,8 +4020,8 @@ def _run_doctor(config: AppConfig) -> int:
             )
             issues.append(f"Windows stdout encoding is {enc!r} — set PYTHONUTF8=1 or use python -X utf8.")
 
-    # ── 6. Known gotchas ─────────────────────────────────────────────────────
-    print(_c(_BOLD, "\n[6] Known API gotchas"))
+    # ── 7. Known gotchas ─────────────────────────────────────────────────────
+    print(_c(_BOLD, "\n[7] Known API gotchas"))
     print(_DOCTOR_KNOWN_GOTCHAS)
 
     # ── Summary ──────────────────────────────────────────────────────────────
@@ -3963,13 +4666,13 @@ def main() -> None:
     if command == "doctor":
         # Doctor only needs the config — not a live backend connection.
         config = AppConfig.from_env()
-        sys.exit(_run_doctor(config))
+        sys.exit(_run_doctor(config, fix=bool(getattr(args, "fix", False))))
 
     config = AppConfig.from_env()
     log_stream = sys.stderr if config.transport == "stdio" else sys.stdout
     configure_logging(config.log_level, stream=log_stream)
     LOGGER.info("waggle_startup")
-    if command in {"edit-graph", "view-graph"}:
+    if command in {"edit-graph", "view-graph", "ui"}:
         try:
             exit_code = _run_graph_editor_command(config, args)
         except ValidationFailure as exc:

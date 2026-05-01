@@ -149,6 +149,19 @@ _RECORD_BLOCK_PATTERN = re.compile(
     r"Date:\s*(?P<date>[^\n]+)",
     re.DOTALL,
 )
+_UPSTREAM_REAL_REQUIRED_FIELDS = {
+    "id",
+    "context_window_id",
+    "context_window_text",
+    "question",
+    "answer",
+    "question_type",
+}
+_SYNTH_INDICATOR_FIELDS = {
+    "task_group",
+    "answer_type",
+    "context_window_text_with_labels",
+}
 
 
 def _parse_pair_answer_users(value: Any) -> set[str]:
@@ -262,11 +275,13 @@ def _read_dataset_records(dataset_path: str | Path) -> list[dict[str, Any]]:
     return records
 
 
-def _infer_dataset_kind(record: dict[str, Any]) -> str:
+def _infer_record_dataset_kind(record: dict[str, Any]) -> str:
+    if _UPSTREAM_REAL_REQUIRED_FIELDS.issubset(record.keys()) and not (_SYNTH_INDICATOR_FIELDS & record.keys()):
+        return "real"
+    if _SYNTH_INDICATOR_FIELDS & record.keys():
+        return "synth"
     if "question_type" in record or "episodes" in record or "campaign" in record:
         return "real"
-    if "task_group" in record or "answer_type" in record or "context_window_text_with_labels" in record:
-        return "synth"
     return "custom"
 
 
@@ -282,6 +297,97 @@ def _context_field(record: dict[str, Any], context_field: str) -> str:
     raise BenchmarkRuntimeError("Could not locate a context field in the OOLONG dataset row.")
 
 
+def _resolve_dataset_kind(records: list[dict[str, Any]], dataset_kind: str) -> str:
+    if dataset_kind != "auto":
+        return dataset_kind
+
+    inferred_kinds = {_infer_record_dataset_kind(record) for record in records}
+    concrete_kinds = {kind for kind in inferred_kinds if kind != "custom"}
+    if len(concrete_kinds) > 1:
+        raise BenchmarkRuntimeError(
+            "Mixed OOLONG dataset shapes are not allowed in one run. "
+            "Split real and synthetic rows into separate dataset files."
+        )
+    if concrete_kinds:
+        return next(iter(concrete_kinds))
+    return "custom"
+
+
+def _build_real_example(record: dict[str, Any], index: int, context_field: str) -> OolongExample:
+    missing_fields = sorted(field for field in _UPSTREAM_REAL_REQUIRED_FIELDS if field not in record)
+    if missing_fields:
+        raise BenchmarkRuntimeError(
+            f"Dataset row {index} is not a valid upstream OOLONG-real record; missing fields: {', '.join(missing_fields)}."
+        )
+
+    field_name = "context_window_text" if context_field == "auto" else _context_field(record, context_field)
+    raw_answer = record.get("answer", "")
+    answer = _normalize_text_answer(_maybe_parse_answer_literal(raw_answer))
+    question = str(record.get("question", "")).strip()
+    if not question:
+        raise BenchmarkRuntimeError(f"Dataset row {index} is missing a question.")
+    context_text = str(record.get(field_name, "")).strip()
+    if not context_text:
+        raise BenchmarkRuntimeError(f"Dataset row {index} is missing context text in '{field_name}'.")
+
+    metadata = {
+        key: value
+        for key, value in record.items()
+        if key not in {field_name, "question", "answer", "gold_answer"}
+    }
+    return OolongExample(
+        example_id=str(record.get("id") or f"example-{index}").strip(),
+        dataset_kind="real",
+        context_window_id=str(record.get("context_window_id") or f"context-{index}").strip(),
+        question=question,
+        answer=answer,
+        raw_answer=raw_answer,
+        context_text=context_text,
+        metadata=metadata,
+    )
+
+
+def _build_nonreal_example(
+    record: dict[str, Any],
+    index: int,
+    *,
+    dataset_kind: str,
+    context_field: str,
+) -> OolongExample:
+    field_name = _context_field(record, context_field)
+    raw_answer = record.get("answer", record.get("gold_answer", ""))
+    answer = _normalize_text_answer(_maybe_parse_answer_literal(raw_answer))
+    question = str(record.get("question", "")).strip()
+    if not question:
+        raise BenchmarkRuntimeError(f"Dataset row {index} is missing a question.")
+    context_text = str(record.get(field_name, "")).strip()
+    if not context_text:
+        raise BenchmarkRuntimeError(f"Dataset row {index} is missing context text in '{field_name}'.")
+    context_window_id = str(
+        record.get("context_window_id")
+        or record.get("window_id")
+        or record.get("conversation_id")
+        or record.get("id")
+        or f"context-{index}"
+    ).strip()
+    example_id = str(record.get("id") or record.get("example_id") or f"example-{index}").strip()
+    metadata = {
+        key: value
+        for key, value in record.items()
+        if key not in {field_name, "question", "answer", "gold_answer"}
+    }
+    return OolongExample(
+        example_id=example_id,
+        dataset_kind=dataset_kind,
+        context_window_id=context_window_id,
+        question=question,
+        answer=answer,
+        raw_answer=raw_answer,
+        context_text=context_text,
+        metadata=metadata,
+    )
+
+
 def load_oolong_examples(
     dataset_path: str | Path,
     *,
@@ -290,43 +396,20 @@ def load_oolong_examples(
     limit: int | None = None,
 ) -> list[OolongExample]:
     records = _read_dataset_records(dataset_path)
+    resolved_dataset_kind = _resolve_dataset_kind(records, dataset_kind)
     examples: list[OolongExample] = []
     for index, record in enumerate(records):
-        resolved_kind = _infer_dataset_kind(record) if dataset_kind == "auto" else dataset_kind
-        field_name = _context_field(record, context_field)
-        raw_answer = record.get("answer", record.get("gold_answer", ""))
-        answer = _normalize_text_answer(_maybe_parse_answer_literal(raw_answer))
-        question = str(record.get("question", "")).strip()
-        if not question:
-            raise BenchmarkRuntimeError(f"Dataset row {index} is missing a question.")
-        context_text = str(record.get(field_name, "")).strip()
-        if not context_text:
-            raise BenchmarkRuntimeError(f"Dataset row {index} is missing context text in '{field_name}'.")
-        context_window_id = str(
-            record.get("context_window_id")
-            or record.get("window_id")
-            or record.get("conversation_id")
-            or record.get("id")
-            or f"context-{index}"
-        ).strip()
-        example_id = str(record.get("id") or f"example-{index}").strip()
-        metadata = {
-            key: value
-            for key, value in record.items()
-            if key not in {field_name, "question", "answer", "gold_answer"}
-        }
-        examples.append(
-            OolongExample(
-                example_id=example_id,
-                dataset_kind=resolved_kind,
-                context_window_id=context_window_id,
-                question=question,
-                answer=answer,
-                raw_answer=raw_answer,
-                context_text=context_text,
-                metadata=metadata,
+        if resolved_dataset_kind == "real":
+            examples.append(_build_real_example(record, index, context_field))
+        else:
+            examples.append(
+                _build_nonreal_example(
+                    record,
+                    index,
+                    dataset_kind=resolved_dataset_kind,
+                    context_field=context_field,
+                )
             )
-        )
         _validate_pair_answer_reachability(examples[-1])
         if limit is not None and len(examples) >= limit:
             break
@@ -465,8 +548,9 @@ def evaluate_oolong(
 ) -> OolongReport:
     if eval_mode not in {"retrieval_only", "waggle_llm", "waggle_rlm"}:
         raise BenchmarkRuntimeError("eval_mode must be one of: retrieval_only, waggle_llm, waggle_rlm.")
-    if retrieval_mode not in {"graph", "fusion", "replay", "aggregate"}:
-        raise BenchmarkRuntimeError("retrieval_mode must be one of: graph, fusion, replay, aggregate.")
+    retrieval_mode = {"fusion": "hybrid", "replay": "verbatim"}.get(retrieval_mode, retrieval_mode)
+    if retrieval_mode not in {"graph", "hybrid", "verbatim", "aggregate"}:
+        raise BenchmarkRuntimeError("retrieval_mode must be one of: graph, hybrid, verbatim, aggregate.")
     if eval_mode == "waggle_llm" and llm_answerer is None:
         raise BenchmarkRuntimeError("waggle_llm mode requires an llm_answerer.")
     if eval_mode == "waggle_rlm" and rlm_backend_kwargs is None and rlm_mock_response_fn is None:
@@ -580,7 +664,7 @@ def evaluate_oolong(
     accuracy = (sum(1 for case in scored if case.correct) / len(scored)) if scored else None
     return OolongReport(
         dataset_path=str(dataset_path),
-        dataset_kind=dataset_kind,
+        dataset_kind=examples[0].dataset_kind if examples else dataset_kind,
         eval_mode=eval_mode,
         retrieval_mode=retrieval_mode,
         case_count=len(per_case),

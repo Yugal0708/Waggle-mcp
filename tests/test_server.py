@@ -18,6 +18,7 @@ from waggle.server import (
     _build_parser,
     _default_graph,
     _run_admin_command,
+    _run_doctor,
     _run_graph_editor_command,
     _run_setup,
     _setup_clients_from_args,
@@ -30,6 +31,9 @@ from waggle.server import (
 
 
 class FakeEmbeddingModel:
+    model_name = "fake-model"
+    model_id = "fake-model:deterministic-v1"
+
     def embed(self, text: str) -> np.ndarray:
         vector = np.zeros(8, dtype=np.float32)
         for token in text.lower().split():
@@ -120,10 +124,13 @@ def test_parser_accepts_graph_editor_commands() -> None:
     view_args = parser.parse_args(["view-graph"])
     diff_args = parser.parse_args(["diff", "--file-a", "a.abhi", "--file-b", "b.abhi"])
     merge_args = parser.parse_args(
-        ["merge", "--base", "base.abhi", "--left", "left.abhi", "--right", "right.abhi", "--output", "merged.abhi"]
+        ["merge", "--base", "base.abhi", "--left", "left.abhi", "--right", "right.abhi", "--output", "merged.abhi", "--merge-strategy", "last_write_wins"]
     )
     query_args = parser.parse_args(["query", "--input", "memory.abhi", "--query-id", "q1"])
     load_chunks_args = parser.parse_args(["load-chunks", "--input", "memory.abhi", "--chunk-id", "decision_1"])
+    push_args = parser.parse_args(["push", "--client-secret-path", "client.json", "--folder-id", "folder123"])
+    pull_args = parser.parse_args(["pull", "file123", "--client-secret-path", "client.json"])
+    share_args = parser.parse_args(["share", "file123", "--client-secret-path", "client.json"])
     oolong_args = parser.parse_args(
         [
             "benchmark-oolong",
@@ -145,13 +152,20 @@ def test_parser_accepts_graph_editor_commands() -> None:
     assert view_args.command == "view-graph"
     assert view_args.open is True
     assert diff_args.command == "diff"
-    assert diff_args.input_path_a == "a.abhi"
+    assert diff_args.input_path_a_flag == "a.abhi"
     assert merge_args.command == "merge"
-    assert merge_args.merge_strategy == "prefer_right"
+    assert merge_args.merge_strategy == "last_write_wins"
     assert query_args.command == "query"
     assert query_args.query_id == "q1"
     assert load_chunks_args.command == "load-chunks"
     assert load_chunks_args.chunk_ids == ["decision_1"]
+    assert push_args.command == "push"
+    assert push_args.encrypt is True
+    assert push_args.folder_id == "folder123"
+    assert pull_args.command == "pull"
+    assert pull_args.file_ref == "file123"
+    assert share_args.command == "share"
+    assert share_args.file_ref == "file123"
     assert oolong_args.command == "benchmark-oolong"
     assert oolong_args.dataset_path == "oolong.jsonl"
     assert oolong_args.eval_mode == "waggle_rlm"
@@ -159,6 +173,105 @@ def test_parser_accepts_graph_editor_commands() -> None:
     assert oolong_args.llm_model == "gemini-2.5-flash-lite"
     assert oolong_args.llm_api_key_env == "GEMINI_API_KEY"
     assert oolong_args.rlm_max_iterations == 6
+
+
+def test_doctor_flags_mixed_embedding_model_ids(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    db_path = tmp_path / "server-memory.db"
+    graph = MemoryGraph(db_path, FakeEmbeddingModel())
+    graph.observe_conversation(
+        user_message="Use FastAPI.",
+        assistant_response="Understood.",
+        session_id="mixed-models",
+        project="audit",
+    )
+
+    with graph._lock, graph._connect() as connection:
+        connection.execute(
+            """
+            UPDATE transcript_records
+            SET embedding_model_id = 'legacy-model:v0'
+            WHERE tenant_id = ? AND session_id = ? AND role = 'assistant'
+            """,
+            (graph.tenant_id, "mixed-models"),
+        )
+
+    config = AppConfig(
+        backend="sqlite",
+        transport="stdio",
+        model_name="fake-model",
+        db_path=str(db_path),
+        default_tenant_id="local-default",
+        http_host="127.0.0.1",
+        http_port=8080,
+        log_level="INFO",
+        rate_limit_rpm=120,
+        write_rate_limit_rpm=60,
+        max_concurrent_requests=8,
+        max_payload_bytes=1024 * 1024,
+        request_timeout_seconds=30,
+        export_dir=None,
+        neo4j_uri="",
+        neo4j_username="",
+        neo4j_password="",
+        neo4j_database="",
+    )
+
+    exit_code = _run_doctor(config)
+    stdout = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Mixed embedding model IDs detected" in stdout
+
+
+def test_doctor_fix_reembeds_mixed_embedding_model_ids(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    db_path = tmp_path / "server-memory.db"
+    graph = MemoryGraph(db_path, FakeEmbeddingModel())
+    graph.observe_conversation(
+        user_message="Use FastAPI.",
+        assistant_response="Understood.",
+        session_id="mixed-models",
+        project="audit",
+    )
+
+    with graph._lock, graph._connect() as connection:
+        connection.execute(
+            """
+            UPDATE transcript_records
+            SET embedding_model_id = 'legacy-model:v0'
+            WHERE tenant_id = ? AND session_id = ? AND role = 'assistant'
+            """,
+            (graph.tenant_id, "mixed-models"),
+        )
+
+    config = AppConfig(
+        backend="sqlite",
+        transport="stdio",
+        model_name="fake-model",
+        db_path=str(db_path),
+        default_tenant_id="local-default",
+        http_host="127.0.0.1",
+        http_port=8080,
+        log_level="INFO",
+        rate_limit_rpm=120,
+        write_rate_limit_rpm=60,
+        max_concurrent_requests=8,
+        max_payload_bytes=1024 * 1024,
+        request_timeout_seconds=30,
+        export_dir=None,
+        neo4j_uri="",
+        neo4j_username="",
+        neo4j_password="",
+        neo4j_database="",
+    )
+
+    exit_code = _run_doctor(config, fix=True)
+    stdout = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Re-embedded stale rows" in stdout
+    repaired = graph.get_embedding_store_health()
+    assert repaired["mixed_models"] is False
+    assert repaired["transcript_stale_rows"] == 0
 
 
 def test_run_admin_command_benchmark_oolong(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -501,6 +614,30 @@ def test_export_validate_inspect_and_import_abhi_tools(tmp_path: Path) -> None:
     assert imported.structuredContent["nodes_created"] == 1
 
 
+def test_export_abhi_tool_refuses_likely_secrets_without_force(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.graph.observe_conversation(
+        user_message="My token is sk-abcdefghijklmnopqrstuvwxyz123456.",
+        assistant_response="I will not repeat the token.",
+        session_id="secret-session",
+        project="security",
+    )
+
+    refused = app.handle_tool_call(
+        "export_abhi",
+        {"output_path": str(tmp_path / "secret.abhi"), "project": "security"},
+    )
+    forced = app.handle_tool_call(
+        "export_abhi",
+        {"output_path": str(tmp_path / "secret-forced.abhi"), "project": "security", "force": True},
+    )
+
+    assert refused.isError is True
+    assert "appear to contain secrets" in refused.content[0].text
+    assert forced.isError is False
+    assert Path(forced.structuredContent["output_path"]).exists()
+
+
 def test_diff_and_merge_abhi_tools(tmp_path: Path) -> None:
     base_app = make_app(tmp_path / "base")
     left_app = make_app(tmp_path / "left")
@@ -578,7 +715,7 @@ def test_query_abhi_tool(tmp_path: Path) -> None:
 
     assert queried.isError is False
     assert queried.structuredContent["query_id"] == "q1"
-    assert queried.structuredContent["executed_actions"]
+    assert "queried_abhi" in queried.structuredContent["executed_actions"]
 
 
 def test_load_abhi_chunks_tool(tmp_path: Path) -> None:
@@ -788,11 +925,11 @@ def test_debug_retrieval_tool(tmp_path: Path) -> None:
     result = app.handle_tool_call("debug_retrieval", {"query": "debug retrieval details", "project": "alpha"})
 
     assert result.isError is False
-    assert result.structuredContent["repo_id"].endswith(":alpha")
-    assert result.structuredContent["embedding_preview"]
-    assert result.structuredContent["selected_windows"]
-    assert result.structuredContent["flat_top_nodes"]
-    assert result.structuredContent["tiered_top_nodes"]
+    assert result.structuredContent["retrieval_mode"] == "hybrid"
+    assert result.structuredContent["layers"]["vector_transcript"] == []
+    assert result.structuredContent["layers"]["vector_node"]
+    assert result.structuredContent["layers"]["lexical"]
+    assert result.structuredContent["hybrid_top_hits"]
 
 
 def test_export_context_bundle_cli_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

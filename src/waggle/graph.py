@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import heapq
 import json
@@ -20,6 +21,7 @@ import networkx as nx
 import numpy as np
 
 from waggle.abhi import (
+    ABHI_ENCRYPTION_ALGORITHM,
     ABHI_SPEC_VERSION,
     abhi_to_snapshot,
     dispatch_abhi_event,
@@ -31,6 +33,7 @@ from waggle.abhi import (
     merge_abhi_files,
     query_abhi_file,
     validate_abhi_document,
+    validate_abhi_signature,
     write_abhi_document,
 )
 from waggle.auth import generate_api_key, hash_api_key, verify_api_key
@@ -97,6 +100,7 @@ from waggle.models import (
     EvidenceRecord,
     GraphDiffResult,
     GraphStats,
+    HybridHit,
     ImportResult,
     MarkdownVaultExportResult,
     MarkdownVaultImportResult,
@@ -122,8 +126,9 @@ from waggle.models import (
     TopicResult,
     utc_now,
 )
+from waggle.retrieval.hybrid import HybridRetrievalConfig, HybridRetriever
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 LOGGER = logging.getLogger(__name__)
 
@@ -301,7 +306,10 @@ CREATE TABLE IF NOT EXISTS nodes (
     tags TEXT DEFAULT '[]',
     metadata TEXT DEFAULT '{}',
     embedding BLOB,
+    embedding_model_id TEXT DEFAULT '',
+    embedding_dim INTEGER DEFAULT 0,
     source_prompt TEXT DEFAULT '',
+    source_turn_pair_id TEXT DEFAULT '',
     evidence_records TEXT DEFAULT '[]',
     valid_from TEXT DEFAULT NULL,
     valid_to TEXT DEFAULT NULL,
@@ -382,6 +390,10 @@ CREATE TABLE IF NOT EXISTS transcript_records (
     role TEXT NOT NULL DEFAULT '',
     transcript_text TEXT NOT NULL,
     embedding BLOB,
+    embedding_model_id TEXT DEFAULT '',
+    embedding_dim INTEGER DEFAULT 0,
+    content_hash TEXT DEFAULT '',
+    turn_pair_id TEXT DEFAULT '',
     metadata TEXT DEFAULT '{}',
     message_identity TEXT DEFAULT NULL
 );
@@ -414,6 +426,9 @@ CREATE INDEX IF NOT EXISTS idx_edges_relationship ON edges(relationship);
 CREATE INDEX IF NOT EXISTS idx_edges_tenant_relationship ON edges(tenant_id, relationship);
 CREATE INDEX IF NOT EXISTS idx_transcripts_tenant_observed ON transcript_records(tenant_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_transcripts_tenant_session_turn ON transcript_records(tenant_id, session_id, turn_index);
+CREATE INDEX IF NOT EXISTS idx_transcripts_tenant_content_hash ON transcript_records(tenant_id, content_hash);
+CREATE INDEX IF NOT EXISTS idx_transcripts_tenant_turn_pair ON transcript_records(tenant_id, turn_pair_id);
+CREATE INDEX IF NOT EXISTS idx_nodes_source_turn_pair ON nodes(tenant_id, source_turn_pair_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
 CREATE INDEX IF NOT EXISTS idx_repos_tenant_name ON repos(tenant_id, name);
@@ -539,6 +554,11 @@ def _merge_scope_value(existing: str, incoming: str) -> str:
     return existing.strip() or incoming.strip()
 
 
+def _normalized_content_hash(text: str) -> str:
+    normalized = normalize_text(text)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 class MemoryGraph:
     """SQLite-backed graph memory with embedding-assisted retrieval."""
 
@@ -554,6 +574,7 @@ class MemoryGraph:
         recency_half_life_days: float = 30.0,
         tiered_retrieval: bool = False,
         tiered_retrieval_top_k_windows: int = 3,
+        hybrid_retrieval_config: HybridRetrievalConfig | None = None,
         export_dir: str | Path | None = None,
     ) -> None:
         self.db_path = Path(db_path).expanduser()
@@ -565,10 +586,16 @@ class MemoryGraph:
         self.recency_half_life_days = recency_half_life_days
         self.tiered_retrieval = tiered_retrieval
         self.tiered_retrieval_top_k_windows = max(1, tiered_retrieval_top_k_windows)
+        self.hybrid_retrieval_config = hybrid_retrieval_config or HybridRetrievalConfig(
+            recency_half_life_days=recency_half_life_days
+        )
         self.export_dir = Path(export_dir).expanduser() if export_dir is not None else self.db_path.parent / "exports"
         self._lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_database()
+
+    def hybrid_retriever(self) -> HybridRetriever:
+        return HybridRetriever(self, config=self.hybrid_retrieval_config)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)
@@ -603,6 +630,7 @@ class MemoryGraph:
         clone.recency_half_life_days = self.recency_half_life_days
         clone.tiered_retrieval = self.tiered_retrieval
         clone.tiered_retrieval_top_k_windows = self.tiered_retrieval_top_k_windows
+        clone.hybrid_retrieval_config = self.hybrid_retrieval_config
         clone.export_dir = self.export_dir
         clone._lock = self._lock
         clone.ensure_tenant(clone.tenant_id)
@@ -848,6 +876,12 @@ class MemoryGraph:
         if "context_window_id" not in node_columns:
             connection.execute("ALTER TABLE nodes ADD COLUMN context_window_id TEXT DEFAULT NULL")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_nodes_context_window ON nodes(context_window_id)")
+        if "embedding_model_id" not in node_columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN embedding_model_id TEXT DEFAULT ''")
+        if "embedding_dim" not in node_columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN embedding_dim INTEGER DEFAULT 0")
+        if "source_turn_pair_id" not in node_columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN source_turn_pair_id TEXT DEFAULT ''")
         if "tenant_id" not in edge_columns:
             connection.execute(
                 f"ALTER TABLE edges ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '{self.tenant_id}'"
@@ -858,6 +892,14 @@ class MemoryGraph:
             connection.execute(
                 "ALTER TABLE transcript_records ADD COLUMN message_identity TEXT DEFAULT NULL"
             )
+        if "embedding_model_id" not in transcript_columns:
+            connection.execute("ALTER TABLE transcript_records ADD COLUMN embedding_model_id TEXT DEFAULT ''")
+        if "embedding_dim" not in transcript_columns:
+            connection.execute("ALTER TABLE transcript_records ADD COLUMN embedding_dim INTEGER DEFAULT 0")
+        if "content_hash" not in transcript_columns:
+            connection.execute("ALTER TABLE transcript_records ADD COLUMN content_hash TEXT DEFAULT ''")
+        if "turn_pair_id" not in transcript_columns:
+            connection.execute("ALTER TABLE transcript_records ADD COLUMN turn_pair_id TEXT DEFAULT ''")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS graph_ui_state (
@@ -886,6 +928,17 @@ class MemoryGraph:
             WHERE message_identity IS NOT NULL
             """
         )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_transcripts_tenant_content_hash ON transcript_records(tenant_id, content_hash)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_transcripts_tenant_turn_pair ON transcript_records(tenant_id, turn_pair_id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_nodes_source_turn_pair ON nodes(tenant_id, source_turn_pair_id)"
+        )
+
+        self._backfill_transcript_storage(connection, batch_size=100)
 
         connection.execute(
             """
@@ -895,12 +948,241 @@ class MemoryGraph:
             (SCHEMA_VERSION, utc_now().isoformat()),
         )
 
-    def ensure_repo(self, project: str = "") -> str:
+    def _current_embedding_model_id(self) -> str:
+        model_id = getattr(self.embedding_model, "model_id", "").strip()
+        if not model_id:
+            model_name = str(getattr(self.embedding_model, "model_name", "") or "").strip()
+            model_id = model_name or self.embedding_model.__class__.__name__
+        if not model_id:
+            raise ValueError("Embedding writes require a non-empty embedding_model_id.")
+        return model_id
+
+    def _embed_with_metadata(self, text: str) -> tuple[np.ndarray, str, int]:
+        embedding = self.embedding_model.embed(text)
+        dim = int(embedding.shape[0]) if getattr(embedding, "shape", None) else 0
+        model_id = self._current_embedding_model_id()
+        if dim <= 0:
+            raise ValueError("Embedding writes require a positive embedding_dim.")
+        return embedding, model_id, dim
+
+    def _backfill_transcript_storage(self, connection: sqlite3.Connection, *, batch_size: int = 100) -> None:
+        pending_user_pairs: dict[str, str] = {}
+        while True:
+            rows = connection.execute(
+                """
+                SELECT id, session_id, turn_index, role, transcript_text, embedding, embedding_model_id, embedding_dim, content_hash, turn_pair_id
+                FROM transcript_records
+                WHERE tenant_id = ?
+                  AND (
+                    embedding IS NULL
+                    OR embedding_model_id = ''
+                    OR embedding_dim = 0
+                    OR content_hash = ''
+                    OR turn_pair_id = ''
+                  )
+                ORDER BY session_id ASC, turn_index ASC, id ASC
+                LIMIT ?
+                """,
+                (self.tenant_id, batch_size),
+            ).fetchall()
+            if not rows:
+                break
+
+            for row in rows:
+                session_id = str(row["session_id"] or "")
+                role = str(row["role"] or "")
+                turn_pair_id = str(row["turn_pair_id"] or "").strip()
+                if not turn_pair_id:
+                    if role == "user":
+                        turn_pair_id = str(uuid4())
+                        pending_user_pairs[session_id] = turn_pair_id
+                    elif role == "assistant" and pending_user_pairs.get(session_id):
+                        turn_pair_id = pending_user_pairs.pop(session_id)
+                    else:
+                        turn_pair_id = str(uuid4())
+
+                content_hash = str(row["content_hash"] or "").strip() or _normalized_content_hash(row["transcript_text"])
+                if row["embedding"] is None or not str(row["embedding_model_id"] or "").strip() or int(row["embedding_dim"] or 0) <= 0:
+                    embedding, model_id, dim = self._embed_with_metadata(row["transcript_text"])
+                    embedding_bytes = self.embedding_model.to_bytes(embedding)
+                else:
+                    model_id = str(row["embedding_model_id"] or "").strip()
+                    dim = int(row["embedding_dim"] or 0)
+                    embedding_bytes = row["embedding"]
+                connection.execute(
+                    """
+                    UPDATE transcript_records
+                    SET embedding = ?, embedding_model_id = ?, embedding_dim = ?, content_hash = ?, turn_pair_id = ?
+                    WHERE tenant_id = ? AND id = ?
+                    """,
+                    (embedding_bytes, model_id, dim, content_hash, turn_pair_id, self.tenant_id, row["id"]),
+                )
+
+        node_rows = connection.execute(
+            """
+            SELECT id, content, embedding, embedding_model_id, embedding_dim
+            FROM nodes
+            WHERE tenant_id = ? AND (embedding_model_id = '' OR embedding_dim = 0)
+            """,
+            (self.tenant_id,),
+        ).fetchall()
+        for row in node_rows:
+            if row["embedding"] is None:
+                embedding, model_id, dim = self._embed_with_metadata(row["content"])
+                embedding_bytes = self.embedding_model.to_bytes(embedding)
+            else:
+                model_id = self._current_embedding_model_id()
+                dim = len(self.embedding_model.from_bytes(row["embedding"]))
+                embedding_bytes = row["embedding"]
+            connection.execute(
+                """
+                UPDATE nodes
+                SET embedding = ?, embedding_model_id = ?, embedding_dim = ?
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (embedding_bytes, model_id, dim, self.tenant_id, row["id"]),
+            )
+
+    def get_embedding_store_health(self) -> dict[str, Any]:
+        with self._lock, self._connect() as connection:
+            transcript_rows = connection.execute(
+                """
+                SELECT embedding_model_id, COUNT(*) AS count
+                FROM transcript_records
+                WHERE tenant_id = ? AND embedding_model_id != ''
+                GROUP BY embedding_model_id
+                ORDER BY embedding_model_id
+                """,
+                (self.tenant_id,),
+            ).fetchall()
+            node_rows = connection.execute(
+                """
+                SELECT embedding_model_id, COUNT(*) AS count
+                FROM nodes
+                WHERE tenant_id = ? AND embedding_model_id != ''
+                GROUP BY embedding_model_id
+                ORDER BY embedding_model_id
+                """,
+                (self.tenant_id,),
+            ).fetchall()
+            transcript_stale = int(connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM transcript_records
+                WHERE tenant_id = ?
+                  AND (
+                    embedding IS NULL
+                    OR embedding_model_id = ''
+                    OR embedding_dim = 0
+                    OR embedding_model_id != ?
+                  )
+                """,
+                (self.tenant_id, self._current_embedding_model_id()),
+            ).fetchone()[0])
+            node_stale = int(connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM nodes
+                WHERE tenant_id = ?
+                  AND (
+                    embedding IS NULL
+                    OR embedding_model_id = ''
+                    OR embedding_dim = 0
+                    OR embedding_model_id != ?
+                  )
+                """,
+                (self.tenant_id, self._current_embedding_model_id()),
+            ).fetchone()[0])
+        return {
+            "current_model_id": self._current_embedding_model_id(),
+            "transcript_model_counts": {str(row["embedding_model_id"]): int(row["count"]) for row in transcript_rows},
+            "node_model_counts": {str(row["embedding_model_id"]): int(row["count"]) for row in node_rows},
+            "transcript_stale_rows": transcript_stale,
+            "node_stale_rows": node_stale,
+            "mixed_models": (len(transcript_rows) > 1) or (len(node_rows) > 1),
+        }
+
+    def reembed_stale_embeddings(self, *, batch_size: int = 100) -> dict[str, int]:
+        transcript_updated = 0
+        node_updated = 0
+        current_model_id = self._current_embedding_model_id()
+        with self._lock, self._connect() as connection:
+            while True:
+                transcript_rows = connection.execute(
+                    """
+                    SELECT id, transcript_text
+                    FROM transcript_records
+                    WHERE tenant_id = ?
+                      AND (
+                        embedding IS NULL
+                        OR embedding_model_id = ''
+                        OR embedding_dim = 0
+                        OR embedding_model_id != ?
+                      )
+                    ORDER BY observed_at ASC, turn_index ASC, id ASC
+                    LIMIT ?
+                    """,
+                    (self.tenant_id, current_model_id, batch_size),
+                ).fetchall()
+                if not transcript_rows:
+                    break
+                for row in transcript_rows:
+                    embedding, model_id, dim = self._embed_with_metadata(row["transcript_text"])
+                    connection.execute(
+                        """
+                        UPDATE transcript_records
+                        SET embedding = ?, embedding_model_id = ?, embedding_dim = ?, content_hash = ?
+                        WHERE tenant_id = ? AND id = ?
+                        """,
+                        (
+                            self.embedding_model.to_bytes(embedding),
+                            model_id,
+                            dim,
+                            _normalized_content_hash(row["transcript_text"]),
+                            self.tenant_id,
+                            row["id"],
+                        ),
+                    )
+                    transcript_updated += 1
+
+            while True:
+                node_rows = connection.execute(
+                    """
+                    SELECT id, content
+                    FROM nodes
+                    WHERE tenant_id = ?
+                      AND (
+                        embedding IS NULL
+                        OR embedding_model_id = ''
+                        OR embedding_dim = 0
+                        OR embedding_model_id != ?
+                      )
+                    ORDER BY updated_at ASC, id ASC
+                    LIMIT ?
+                    """,
+                    (self.tenant_id, current_model_id, batch_size),
+                ).fetchall()
+                if not node_rows:
+                    break
+                for row in node_rows:
+                    embedding, model_id, dim = self._embed_with_metadata(row["content"])
+                    connection.execute(
+                        """
+                        UPDATE nodes
+                        SET embedding = ?, embedding_model_id = ?, embedding_dim = ?
+                        WHERE tenant_id = ? AND id = ?
+                        """,
+                        (self.embedding_model.to_bytes(embedding), model_id, dim, self.tenant_id, row["id"]),
+                    )
+                    node_updated += 1
+        return {"transcript_rows_updated": transcript_updated, "node_rows_updated": node_updated}
+
+    def ensure_repo(self, project: str = "", connection: sqlite3.Connection | None = None) -> str:
         name = project.strip() or "default"
         repo_id = f"{self.tenant_id}:{slugify(name)}"
         now = utc_now().isoformat()
-        with self._lock, self._connect() as connection:
-            connection.execute(
+        def _ensure(active_connection: sqlite3.Connection) -> str:
+            active_connection.execute(
                 """
                 INSERT INTO repos (id, tenant_id, name, description, created_at, updated_at)
                 VALUES (?, ?, ?, '', ?, ?)
@@ -908,19 +1190,29 @@ class MemoryGraph:
                 """,
                 (repo_id, self.tenant_id, name, now, now),
             )
-            row = connection.execute(
+            row = active_connection.execute(
                 "SELECT id FROM repos WHERE tenant_id = ? AND name = ?",
                 (self.tenant_id, name),
             ).fetchone()
-        return str(row["id"])
+            return str(row["id"])
 
-    def ensure_context_window(self, session_id: str = "", repo_id: str | None = None) -> str:
+        if connection is not None:
+            return _ensure(connection)
+        with self._lock, self._connect() as managed_connection:
+            return _ensure(managed_connection)
+
+    def ensure_context_window(
+        self,
+        session_id: str = "",
+        repo_id: str | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> str:
         normalized_session = session_id.strip() or "default"
-        resolved_repo_id = repo_id or self.ensure_repo("default")
+        resolved_repo_id = repo_id or self.ensure_repo("default", connection=connection)
         window_id = f"{resolved_repo_id}:{slugify(normalized_session)}"
         now = utc_now().isoformat()
-        with self._lock, self._connect() as connection:
-            connection.execute(
+        def _ensure(active_connection: sqlite3.Connection) -> str:
+            active_connection.execute(
                 """
                 INSERT INTO context_windows (
                     id, tenant_id, repo_id, session_id, title, status, node_count,
@@ -931,18 +1223,28 @@ class MemoryGraph:
                 """,
                 (window_id, self.tenant_id, resolved_repo_id, normalized_session, now, now),
             )
-            row = connection.execute(
+            row = active_connection.execute(
                 """
                 SELECT id FROM context_windows
                 WHERE tenant_id = ? AND repo_id = ? AND session_id = ?
                 """,
                 (self.tenant_id, resolved_repo_id, normalized_session),
             ).fetchone()
-        return str(row["id"])
+            return str(row["id"])
 
-    def resolve_window_context(self, project: str | None = None, session_id: str | None = None) -> tuple[str, str]:
-        repo_id = self.ensure_repo(project or "default")
-        window_id = self.ensure_context_window(session_id or "default", repo_id)
+        if connection is not None:
+            return _ensure(connection)
+        with self._lock, self._connect() as managed_connection:
+            return _ensure(managed_connection)
+
+    def resolve_window_context(
+        self,
+        project: str | None = None,
+        session_id: str | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> tuple[str, str]:
+        repo_id = self.ensure_repo(project or "default", connection=connection)
+        window_id = self.ensure_context_window(session_id or "default", repo_id, connection=connection)
         return repo_id, window_id
 
     def update_window_node_count(self, window_id: str) -> int:
@@ -1360,11 +1662,13 @@ class MemoryGraph:
     def add_node(
         self,
         *,
+        node_id: str | None = None,
         label: str,
         content: str,
         node_type: NodeType,
         tags: list[str] | None = None,
         source_prompt: str = "",
+        source_turn_pair_id: str = "",
         agent_id: str = "",
         project: str = "",
         session_id: str = "",
@@ -1373,12 +1677,22 @@ class MemoryGraph:
         valid_to: datetime | None = None,
         context_window_id: str | None = None,
         embedding: np.ndarray | None = None,
+        metadata: dict[str, Any] | None = None,
         connection: sqlite3.Connection | None = None,
     ) -> NodeStoreResult:
         resolved_context_window_id = context_window_id
         if resolved_context_window_id is None:
-            _, resolved_context_window_id = self.resolve_window_context(project=project, session_id=session_id)
+            _, resolved_context_window_id = self.resolve_window_context(project=project, session_id=session_id, connection=connection)
+        node_kwargs: dict[str, Any] = {}
+        if node_id is not None and str(node_id).strip():
+            node_kwargs["id"] = str(node_id).strip()
+        embedding_vector, embedding_model_id, embedding_dim = (
+            self._embed_with_metadata(content) if embedding is None else (embedding, self._current_embedding_model_id(), int(embedding.shape[0]))
+        )
+        if embedding_dim <= 0:
+            raise ValueError("Node writes require embedding_dim metadata.")
         node = Node(
+            **node_kwargs,
             tenant_id=self.tenant_id,
             agent_id=agent_id,
             project=project,
@@ -1389,12 +1703,14 @@ class MemoryGraph:
             node_type=node_type,
             tags=tags or [],
             source_prompt=source_prompt,
-            metadata={},
+            embedding_model_id=embedding_model_id,
+            embedding_dim=embedding_dim,
+            source_turn_pair_id=source_turn_pair_id,
+            metadata=metadata or {},
             evidence_records=evidence_records or [],
             valid_from=valid_from,
             valid_to=valid_to,
         )
-        embedding_vector = embedding if embedding is not None else self.embedding_model.embed(node.content)
 
         def _insert(active_connection: sqlite3.Connection) -> NodeStoreResult:
             if self.enable_dedup:
@@ -1427,11 +1743,11 @@ class MemoryGraph:
                 """
                 INSERT INTO nodes (
                     id, tenant_id, agent_id, project, session_id, context_window_id,
-                    label, content, node_type, tags, metadata, embedding,
-                    source_prompt, evidence_records, valid_from, valid_to,
+                    label, content, node_type, tags, metadata, embedding, embedding_model_id, embedding_dim,
+                    source_prompt, source_turn_pair_id, evidence_records, valid_from, valid_to,
                     created_at, updated_at, access_count
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     node.id,
@@ -1446,7 +1762,10 @@ class MemoryGraph:
                     json.dumps(node.tags),
                     _encode_metadata(node.metadata),
                     self.embedding_model.to_bytes(embedding_vector),
+                    node.embedding_model_id,
+                    node.embedding_dim,
                     node.source_prompt,
+                    node.source_turn_pair_id,
                     _encode_evidence_records(node.evidence_records),
                     node.valid_from.isoformat() if node.valid_from is not None else None,
                     node.valid_to.isoformat() if node.valid_to is not None else None,
@@ -1468,6 +1787,7 @@ class MemoryGraph:
     def add_edge(
         self,
         *,
+        edge_id: str | None = None,
         source_id: str,
         target_id: str,
         relationship: str | RelationType,
@@ -1475,7 +1795,11 @@ class MemoryGraph:
         metadata: dict[str, Any] | None = None,
         connection: sqlite3.Connection | None = None,
         ) -> Edge:
+        edge_kwargs: dict[str, Any] = {}
+        if edge_id is not None and str(edge_id).strip():
+            edge_kwargs["id"] = str(edge_id).strip()
         edge = Edge(
+            **edge_kwargs,
             tenant_id=self.tenant_id,
             source_id=source_id,
             target_id=target_id,
@@ -1694,8 +2018,25 @@ class MemoryGraph:
         if expand_depth < 0:
             raise ValueError("expand_depth cannot be negative.")
         normalized_mode = retrieval_mode.strip().lower()
-        if normalized_mode not in {"graph", "replay", "fusion"}:
-            raise ValueError("retrieval_mode must be one of: graph, replay, fusion.")
+        normalized_mode = {"replay": "verbatim", "fusion": "hybrid"}.get(normalized_mode, normalized_mode)
+        if normalized_mode not in {"graph", "verbatim", "hybrid"}:
+            raise ValueError("retrieval_mode must be one of: graph, verbatim, hybrid.")
+
+        if normalized_mode in {"verbatim", "hybrid"}:
+            hybrid = self.hybrid_retriever()
+            debug = hybrid.retrieve_debug(
+                query=query_text,
+                project=project,
+                agent_id=agent_id,
+                session_id=session_id,
+                top_k=max_nodes,
+                mode=normalized_mode,
+            )
+            return self._subgraph_from_hybrid_hits(
+                query=query_text,
+                retrieval_mode=normalized_mode,
+                hybrid_hits=debug["hits"],
+            )
 
         graph_result = (
             self.tiered_query(
@@ -1726,17 +2067,17 @@ class MemoryGraph:
                 project=project,
                 session_id=session_id,
             )
-            if normalized_mode in {"replay", "fusion"}
+            if normalized_mode in {"verbatim", "hybrid"}
             else []
         )
         if normalized_mode == "graph":
             if graph_result.retrieval_mode not in {"tiered", "flat_fallback"}:
                 graph_result.retrieval_mode = "graph"
             return graph_result
-        if normalized_mode == "replay":
+        if normalized_mode == "verbatim":
             return SubgraphResult(
                 replay_hits=replay_hits,
-                retrieval_mode="replay",
+                retrieval_mode="verbatim",
                 query=query_text,
                 total_nodes_in_graph=graph_result.total_nodes_in_graph if graph_result is not None else 0,
             )
@@ -1746,9 +2087,50 @@ class MemoryGraph:
             edges=graph_result.edges if graph_result is not None else [],
             replay_hits=replay_hits,
             fusion_hits=fusion_hits[:max_nodes],
-            retrieval_mode="fusion",
+            retrieval_mode="hybrid",
             query=query_text,
             total_nodes_in_graph=graph_result.total_nodes_in_graph if graph_result is not None else 0,
+        )
+
+    def _subgraph_from_hybrid_hits(
+        self,
+        *,
+        query: str,
+        retrieval_mode: str,
+        hybrid_hits: list[HybridHit],
+    ) -> SubgraphResult:
+        node_ids = sorted({node_id for hit in hybrid_hits for node_id in hit.node_ids})
+        with self._lock, self._connect() as connection:
+            nodes = self._fetch_nodes_by_ids(connection, node_ids)
+            edges = self._fetch_edges_for_nodes(connection, node_ids) if node_ids else []
+            total_nodes = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM nodes WHERE tenant_id = ?",
+                    (self.tenant_id,),
+                ).fetchone()[0]
+            )
+        replay_hits = [
+            ReplayHit(
+                score=hit.score,
+                session_id="",
+                turn_index=0,
+                turn_pair_id=hit.turn_pair_id,
+                role="",
+                transcript_text=hit.content,
+                transcript_snippet=hit.content[:280],
+                observed_at=hit.observed_at or utc_now(),
+            )
+            for hit in hybrid_hits
+            if hit.source in {"transcript", "both"}
+        ]
+        return SubgraphResult(
+            nodes=nodes,
+            edges=edges,
+            replay_hits=replay_hits,
+            hybrid_hits=hybrid_hits,
+            retrieval_mode=retrieval_mode,
+            query=query,
+            total_nodes_in_graph=total_nodes,
         )
 
     def aggregate(
@@ -2033,6 +2415,7 @@ class MemoryGraph:
         session_id: str = "",
         max_nodes: int = 10,
         max_depth: int = 2,
+        retrieval_mode: str = "hybrid",
     ) -> dict[str, Any]:
         query_text = query.strip()
         if not query_text:
@@ -2041,6 +2424,38 @@ class MemoryGraph:
             raise ValueError("max_nodes must be at least 1.")
         if max_depth < 0:
             raise ValueError("max_depth cannot be negative.")
+
+        normalized_mode = {"replay": "verbatim", "fusion": "hybrid"}.get(retrieval_mode.strip().lower(), retrieval_mode.strip().lower())
+        if normalized_mode in {"hybrid", "verbatim"}:
+            debug = self.hybrid_retriever().retrieve_debug(
+                query=query_text,
+                project=project,
+                agent_id=agent_id,
+                session_id=session_id,
+                top_k=max_nodes,
+                mode=normalized_mode,
+            )
+            return {
+                "query": query_text,
+                "project": project,
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "retrieval_mode": normalized_mode,
+                "layers": debug["layers"],
+                "hybrid_top_hits": [
+                    {
+                        "content": hit.content,
+                        "score": hit.score,
+                        "source": hit.source,
+                        "turn_pair_id": hit.turn_pair_id,
+                        "node_ids": hit.node_ids,
+                        "reasoning_from_reranker": hit.reasoning_from_reranker,
+                        "layer_scores": hit.layer_scores,
+                    }
+                    for hit in debug["hits"]
+                ],
+                "fused_top20": debug["fused_top20"],
+            }
 
         expanded_query = self._expand_query_aliases(query_text)
         query_embedding = self.embedding_model.embed(expanded_query)
@@ -2693,8 +3108,11 @@ class MemoryGraph:
             updated_tags = tags if tags is not None else node.tags
             updated_at = utc_now()
             embedding_bytes = row["embedding"]
+            embedding_model_id = node.embedding_model_id
+            embedding_dim = node.embedding_dim
             if content is not None:
-                embedding_bytes = self.embedding_model.to_bytes(self.embedding_model.embed(updated_content))
+                embedding_vector, embedding_model_id, embedding_dim = self._embed_with_metadata(updated_content)
+                embedding_bytes = self.embedding_model.to_bytes(embedding_vector)
 
             updated_node = Node(
                 id=node.id,
@@ -2707,6 +3125,9 @@ class MemoryGraph:
                 node_type=node.node_type,
                 tags=updated_tags,
                 source_prompt=node.source_prompt,
+                embedding_model_id=embedding_model_id,
+                embedding_dim=embedding_dim,
+                source_turn_pair_id=node.source_turn_pair_id,
                 metadata=node.metadata,
                 evidence_records=evidence_records if evidence_records is not None else node.evidence_records,
                 valid_from=valid_from if valid_from is not None else node.valid_from,
@@ -2719,7 +3140,7 @@ class MemoryGraph:
             connection.execute(
                 """
                 UPDATE nodes
-                SET label = ?, content = ?, tags = ?, metadata = ?, embedding = ?, updated_at = ?,
+                SET label = ?, content = ?, tags = ?, metadata = ?, embedding = ?, embedding_model_id = ?, embedding_dim = ?, updated_at = ?,
                     agent_id = ?, project = ?, session_id = ?,
                     evidence_records = ?, valid_from = ?, valid_to = ?
                 WHERE id = ? AND tenant_id = ?
@@ -2730,6 +3151,8 @@ class MemoryGraph:
                     json.dumps(updated_node.tags),
                     _encode_metadata(updated_node.metadata),
                     embedding_bytes,
+                    updated_node.embedding_model_id,
+                    updated_node.embedding_dim,
                     updated_node.updated_at.isoformat(),
                     updated_node.agent_id,
                     updated_node.project,
@@ -3197,18 +3620,37 @@ class MemoryGraph:
         project: str = "",
         agent_id: str = "",
         session_id: str = "",
+        scope: str = "all",
+        since_date: str = "",
+        include_embeddings: bool = True,
+        passphrase: str = "",
+        redact_patterns: list[str] | None = None,
+        sign: bool = False,
+        signing_key_dir: str | Path | None = None,
     ) -> AbhiExportResult:
         with self._lock, self._connect() as connection:
-            snapshot = self._build_backup_snapshot(connection)
+            snapshot = self._build_backup_snapshot(connection, include_embeddings=include_embeddings)
         snapshot["ui"] = self.get_ui_state(project=project, agent_id=agent_id, session_id=session_id)
-        filtered = filter_snapshot_by_scope(snapshot, project=project, agent_id=agent_id, session_id=session_id)
         if output_path is None:
             self.export_dir.mkdir(parents=True, exist_ok=True)
             timestamp = utc_now().strftime("%Y%m%d-%H%M%S")
             destination = self.export_dir / f"waggle-memory-{timestamp}.abhi"
         else:
             destination = Path(output_path).expanduser()
-        return write_abhi_document(filtered, output_path=destination)
+        return write_abhi_document(
+            snapshot,
+            output_path=destination,
+            passphrase=passphrase,
+            scope=scope,
+            project=project,
+            agent_id=agent_id,
+            session_id=session_id,
+            since_date=since_date,
+            include_embeddings=include_embeddings,
+            redact_patterns=redact_patterns,
+            sign=sign,
+            signing_key_dir=signing_key_dir,
+        )
 
     def get_graph_snapshot(
         self,
@@ -3251,8 +3693,9 @@ class MemoryGraph:
             raise ValidationFailure("format must be one of: markdown, json, both.")
         if normalized_audience not in {"llm", "human"}:
             raise ValidationFailure("audience must be one of: llm, human.")
-        if normalized_retrieval_mode not in {"graph", "replay", "fusion"}:
-            raise ValidationFailure("retrieval_mode must be one of: graph, replay, fusion.")
+        normalized_retrieval_mode = {"replay": "verbatim", "fusion": "hybrid"}.get(normalized_retrieval_mode, normalized_retrieval_mode)
+        if normalized_retrieval_mode not in {"graph", "verbatim", "hybrid"}:
+            raise ValidationFailure("retrieval_mode must be one of: graph, verbatim, hybrid.")
         if normalized_mode == "query" and not query.strip():
             raise ValidationFailure("query is required when mode='query'.")
         if normalized_mode != "query" and normalized_retrieval_mode != "graph":
@@ -3557,6 +4000,7 @@ class MemoryGraph:
                 if window_id:
                     self._update_window_node_count(connection, window_id)
                     self._mark_window_embedding_stale(connection, window_id)
+                    self._upsert_snapshot_context_window(connection, {**raw_window, "tenant_id": self.tenant_id})
         self.save_ui_state(
             positions=snapshot.get("ui", {}).get("positions", {}),
             zoom=snapshot.get("ui", {}).get("zoom", 1.0),
@@ -3567,19 +4011,19 @@ class MemoryGraph:
         )
         return result
 
-    def validate_abhi(self, *, input_path: str | Path) -> AbhiValidationResult:
-        document = load_abhi_document(input_path)
+    def validate_abhi(self, *, input_path: str | Path, passphrase: str = "") -> AbhiValidationResult:
+        document = load_abhi_document(input_path, passphrase=passphrase)
         return validate_abhi_document(document, input_path=input_path)
 
-    def inspect_abhi(self, *, input_path: str | Path) -> AbhiInspectResult:
-        document = load_abhi_document(input_path)
+    def inspect_abhi(self, *, input_path: str | Path, passphrase: str = "") -> AbhiInspectResult:
+        document = load_abhi_document(input_path, passphrase=passphrase)
         return inspect_abhi_document(document, input_path=input_path)
 
     def diff_abhi(self, *, input_path_a: str | Path, input_path_b: str | Path) -> AbhiDiffResult:
         return diff_abhi_files(input_path_a=input_path_a, input_path_b=input_path_b)
 
-    def query_abhi(self, *, input_path: str | Path, query_id: str = "", query_text: str = "") -> AbhiQueryResult:
-        return query_abhi_file(input_path=input_path, query_id=query_id, query_text=query_text)
+    def query_abhi(self, *, input_path: str | Path, query_id: str = "", query_text: str = "", passphrase: str = "") -> AbhiQueryResult:
+        return query_abhi_file(input_path=input_path, query_id=query_id, query_text=query_text, passphrase=passphrase)
 
     def load_abhi_chunks(
         self,
@@ -3588,12 +4032,14 @@ class MemoryGraph:
         chunk_ids: list[str] | None = None,
         query_id: str = "",
         query_text: str = "",
+        passphrase: str = "",
     ) -> AbhiChunkLoadResult:
         return load_abhi_chunk_file(
             input_path=input_path,
             chunk_ids=chunk_ids or [],
             query_id=query_id,
             query_text=query_text,
+            passphrase=passphrase,
         )
 
     def merge_abhi(
@@ -3613,14 +4059,34 @@ class MemoryGraph:
             merge_strategy=merge_strategy,
         )
 
-    def import_abhi(self, *, input_path: str | Path) -> AbhiImportResult:
+    def import_abhi(
+        self,
+        *,
+        input_path: str | Path,
+        passphrase: str = "",
+        namespace: str = "",
+        merge_strategy: str = "skip-existing",
+        verify_signature: bool = False,
+        read_only: bool = False,
+        reembed_on_mismatch: bool = False,
+    ) -> AbhiImportResult:
         source = Path(input_path).expanduser()
-        document = load_abhi_document(source)
+        document = load_abhi_document(source, passphrase=passphrase)
         validation = validate_abhi_document(document, input_path=source)
         if not validation.valid:
             raise ValidationFailure("Invalid .abhi file: " + "; ".join(validation.errors))
+        if verify_signature:
+            validate_abhi_signature(document)
         executed_actions = dispatch_abhi_event(document, event_name="on_import", persist=False, input_path=source)
-        snapshot = abhi_to_snapshot(document, fallback_tenant_id=self.tenant_id)
+        source_model_id = str(document.get("manifest", {}).get("embedding_model_id", "")).strip()
+        current_model_id = self._current_embedding_model_id()
+        snapshot = abhi_to_snapshot(
+            document,
+            fallback_tenant_id=self.tenant_id,
+            namespace=namespace,
+            read_only=read_only,
+            reembed_on_import=bool(reembed_on_mismatch and source_model_id and source_model_id != current_model_id),
+        )
 
         with self._lock, self._connect() as connection:
             snapshot_tenant = str(snapshot.get("tenant_id") or self.tenant_id)
@@ -3630,8 +4096,18 @@ class MemoryGraph:
                 schema_version=int(snapshot.get("schema_version", 1)),
                 abhi_spec_version=validation.abhi_spec_version or ABHI_SPEC_VERSION,
                 hash_verified=True,
+                embedding_count=validation.embedding_count,
+                encrypted=bool(passphrase),
+                encryption_algorithm=ABHI_ENCRYPTION_ALGORITHM if passphrase else "",
                 executed_actions=executed_actions,
             )
+            for raw_transcript in snapshot.get("transcripts", []):
+                existing_transcript = self._fetch_transcript_row(connection, raw_transcript["id"])
+                if existing_transcript is None:
+                    self._insert_snapshot_transcript(connection, raw_transcript)
+                elif merge_strategy in {"overwrite", "branch"}:
+                    self._update_snapshot_transcript(connection, raw_transcript)
+
             for raw_repo in snapshot.get("repos", []):
                 self._upsert_snapshot_repo(connection, {**raw_repo, "tenant_id": self.tenant_id})
 
@@ -3645,7 +4121,7 @@ class MemoryGraph:
                 if self._fetch_node_row(connection, raw_node["id"]) is None:
                     self._insert_snapshot_node(connection, raw_node)
                     result.nodes_created += 1
-                else:
+                elif merge_strategy in {"overwrite", "branch"}:
                     self._update_snapshot_node(connection, raw_node)
                     result.nodes_updated += 1
 
@@ -3656,7 +4132,7 @@ class MemoryGraph:
                 if self._fetch_edge_row(connection, raw_edge["id"]) is None:
                     self._insert_snapshot_edge(connection, raw_edge)
                     result.edges_created += 1
-                else:
+                elif merge_strategy in {"overwrite", "branch"}:
                     self._update_snapshot_edge(connection, raw_edge)
                     result.edges_updated += 1
 
@@ -3671,6 +4147,7 @@ class MemoryGraph:
                 if window_id:
                     self._update_window_node_count(connection, window_id)
                     self._mark_window_embedding_stale(connection, window_id)
+                    self._upsert_snapshot_context_window(connection, {**raw_window, "tenant_id": self.tenant_id})
         self.save_ui_state(
             positions=snapshot.get("ui", {}).get("positions", {}),
             zoom=snapshot.get("ui", {}).get("zoom", 1.0),
@@ -3752,6 +4229,7 @@ class MemoryGraph:
         *,
         candidates: list[dict[str, Any]],
         transcript: str,
+        source_turn_pair_id: str,
         user_turn_index: int,
         assistant_turn_index: int,
         observed_at: datetime,
@@ -3759,6 +4237,7 @@ class MemoryGraph:
         agent_id: str,
         project: str,
         edge_origin: str = "observe_conversation",
+        connection: sqlite3.Connection | None = None,
     ) -> ObservationResult:
         """Shared extraction helper used by both observe_conversation and ingest_transcript_handoff.
 
@@ -3787,11 +4266,13 @@ class MemoryGraph:
                 node_type=candidate["node_type"],
                 tags=candidate_tags,
                 source_prompt=transcript,
+                source_turn_pair_id=source_turn_pair_id,
                 agent_id=agent_id,
                 project=project,
                 session_id=session_id,
                 evidence_records=[evidence],
                 valid_from=observed_at,
+                connection=connection,
             )
             result.stored_nodes.append(store_result.node)
             stored_candidate_records.append((store_result.node, candidate_tags))
@@ -3824,10 +4305,12 @@ class MemoryGraph:
                     target_id=rationale_node.id,
                     relationship=RelationType.DEPENDS_ON,
                     metadata={"origin": edge_origin},
+                    connection=connection,
                 )
         self._link_observation_candidate_neighbors(
             stored_candidate_records=stored_candidate_records,
             edge_origin=edge_origin,
+            connection=connection,
         )
         return result
 
@@ -3836,6 +4319,7 @@ class MemoryGraph:
         *,
         stored_candidate_records: list[tuple[Node, list[str]]],
         edge_origin: str,
+        connection: sqlite3.Connection | None = None,
     ) -> None:
         if len(stored_candidate_records) < 2:
             return
@@ -3878,6 +4362,7 @@ class MemoryGraph:
                         target_id=to_id,
                         relationship=relationship,
                         metadata={"origin": edge_origin, "inferred": reason},
+                        connection=connection,
                     )
                     created_pairs.add(key)
 
@@ -3892,6 +4377,7 @@ class MemoryGraph:
     ) -> ObservationResult:
         transcript = f"user: {user_message.strip()}\nassistant: {assistant_response.strip()}".strip()
         observed_at = utc_now()
+        turn_pair_id = str(uuid4())
         candidates = extract_conversation_candidates(
             user_message=user_message,
             assistant_response=assistant_response,
@@ -3915,21 +4401,23 @@ class MemoryGraph:
                     turn_index=turn_index,
                     role=role,
                     transcript_text=text,
+                    turn_pair_id=turn_pair_id,
                 )
-
-        result = self._apply_observation_candidates(
-            candidates=candidates,
-            transcript=transcript,
-            user_turn_index=next_turn_index,
-            assistant_turn_index=next_turn_index + 1,
-            observed_at=observed_at,
-            session_id=session_id,
-            agent_id=agent_id,
-            project=project,
-        )
-        repo_id, window_id = self.resolve_window_context(project=project, session_id=session_id)
-        self.update_window_node_count(window_id)
-        self.mark_window_embedding_stale(window_id)
+            result = self._apply_observation_candidates(
+                candidates=candidates,
+                transcript=transcript,
+                source_turn_pair_id=turn_pair_id,
+                user_turn_index=next_turn_index,
+                assistant_turn_index=next_turn_index + 1,
+                observed_at=observed_at,
+                session_id=session_id,
+                agent_id=agent_id,
+                project=project,
+                connection=connection,
+            )
+            repo_id, window_id = self.resolve_window_context(project=project, session_id=session_id, connection=connection)
+            self._update_window_node_count(connection, window_id)
+            self._mark_window_embedding_stale(connection, window_id)
         self.derive_context_window_edges(window_id, repo_id)
         return result
 
@@ -4153,6 +4641,7 @@ class MemoryGraph:
                     turn_result = self._apply_observation_candidates(
                         candidates=candidates,
                         transcript=transcript,
+                        source_turn_pair_id=str(uuid4()),
                         user_turn_index=user_turn_index,
                         assistant_turn_index=assistant_turn_index,
                         observed_at=observed_at,
@@ -4711,6 +5200,7 @@ class MemoryGraph:
     ) -> Node:
         merged_tags = list(dict.fromkeys([*existing_node.tags, *incoming_node.tags]))
         updated_source_prompt = existing_node.source_prompt or incoming_node.source_prompt
+        updated_source_turn_pair_id = existing_node.source_turn_pair_id or incoming_node.source_turn_pair_id
         merged_metadata = dict(existing_node.metadata)
         for key, value in incoming_node.metadata.items():
             if key not in merged_metadata:
@@ -4727,7 +5217,7 @@ class MemoryGraph:
             """
             UPDATE nodes
             SET agent_id = ?, project = ?, session_id = ?, context_window_id = COALESCE(context_window_id, ?),
-                tags = ?, metadata = ?, source_prompt = ?, evidence_records = ?, valid_from = ?, valid_to = ?, updated_at = ?
+                tags = ?, metadata = ?, source_prompt = ?, embedding_model_id = ?, embedding_dim = ?, source_turn_pair_id = ?, evidence_records = ?, valid_from = ?, valid_to = ?, updated_at = ?
             WHERE id = ? AND tenant_id = ?
             """,
             (
@@ -4738,6 +5228,9 @@ class MemoryGraph:
                 json.dumps(merged_tags),
                 _encode_metadata(merged_metadata),
                 updated_source_prompt,
+                existing_node.embedding_model_id or incoming_node.embedding_model_id,
+                existing_node.embedding_dim or incoming_node.embedding_dim,
+                updated_source_turn_pair_id,
                 _encode_evidence_records(merged_evidence),
                 merged_valid_from.isoformat() if merged_valid_from is not None else None,
                 merged_valid_to.isoformat() if merged_valid_to is not None else None,
@@ -4758,6 +5251,9 @@ class MemoryGraph:
             node_type=existing_node.node_type,
             tags=merged_tags,
             source_prompt=updated_source_prompt,
+            embedding_model_id=existing_node.embedding_model_id or incoming_node.embedding_model_id,
+            embedding_dim=existing_node.embedding_dim or incoming_node.embedding_dim,
+            source_turn_pair_id=updated_source_turn_pair_id,
             metadata=merged_metadata,
             evidence_records=merged_evidence,
             valid_from=merged_valid_from,
@@ -4876,7 +5372,7 @@ class MemoryGraph:
     def _fetch_node_row(self, connection: sqlite3.Connection, node_id: str) -> sqlite3.Row | None:
         return connection.execute(
             """
-            SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, source_prompt, metadata, evidence_records, valid_from, valid_to,
+            SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, source_prompt, embedding_model_id, embedding_dim, source_turn_pair_id, metadata, evidence_records, valid_from, valid_to,
                    created_at, updated_at, access_count, embedding, tenant_id
             FROM nodes
             WHERE id = ? AND tenant_id = ?
@@ -4894,7 +5390,7 @@ class MemoryGraph:
         placeholders = ", ".join("?" for _ in node_ids)
         rows = connection.execute(
             f"""
-            SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, source_prompt, metadata, evidence_records, valid_from, valid_to,
+            SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, source_prompt, embedding_model_id, embedding_dim, source_turn_pair_id, metadata, evidence_records, valid_from, valid_to,
                    created_at, updated_at, access_count, tenant_id
             FROM nodes
             WHERE tenant_id = ? AND id IN ({placeholders})
@@ -5032,6 +5528,9 @@ class MemoryGraph:
             node_type=NodeType(row["node_type"]),
             tags=json.loads(row["tags"] or "[]"),
             source_prompt=row["source_prompt"] or "",
+            embedding_model_id=row["embedding_model_id"] if "embedding_model_id" in row_keys else "",
+            embedding_dim=int(row["embedding_dim"] or 0) if "embedding_dim" in row_keys else 0,
+            source_turn_pair_id=row["source_turn_pair_id"] if "source_turn_pair_id" in row_keys else "",
             metadata=_decode_metadata(row["metadata"]) if "metadata" in row_keys else {},
             evidence_records=_decode_evidence_records(row["evidence_records"]) if "evidence_records" in row_keys else [],
             valid_from=_parse_datetime(row["valid_from"]) if "valid_from" in row_keys and row["valid_from"] else None,
@@ -5092,6 +5591,10 @@ class MemoryGraph:
             turn_index=int(row["turn_index"] or 0),
             role=row["role"] or "",
             transcript_text=row["transcript_text"],
+            embedding_model_id=row["embedding_model_id"] if "embedding_model_id" in row.keys() else "",
+            embedding_dim=int(row["embedding_dim"] or 0) if "embedding_dim" in row.keys() else 0,
+            content_hash=row["content_hash"] if "content_hash" in row.keys() else "",
+            turn_pair_id=row["turn_pair_id"] if "turn_pair_id" in row.keys() else "",
             metadata=_decode_metadata(row["metadata"]) if "metadata" in row.keys() else {},
         )
 
@@ -5113,6 +5616,59 @@ class MemoryGraph:
         if normalized_session and record.session_id.strip().lower() != normalized_session:
             return False
         return True
+
+    def list_transcript_records(
+        self,
+        *,
+        agent_id: str = "",
+        project: str = "",
+        session_id: str = "",
+        limit: int = 200,
+    ) -> list[TranscriptRecord]:
+        filters = ["tenant_id = ?"]
+        params: list[Any] = [self.tenant_id]
+        if project.strip():
+            filters.append("project = ?")
+            params.append(project.strip())
+        if session_id.strip():
+            filters.append("session_id = ?")
+            params.append(session_id.strip())
+        elif agent_id.strip():
+            filters.append("agent_id = ?")
+            params.append(agent_id.strip())
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, tenant_id, agent_id, project, session_id, observed_at, turn_index, role, transcript_text,
+                       embedding_model_id, embedding_dim, content_hash, turn_pair_id, metadata
+                FROM transcript_records
+                WHERE {" AND ".join(filters)}
+                ORDER BY observed_at ASC, turn_index ASC
+                LIMIT ?
+                """,
+                (*params, max(1, int(limit))),
+            ).fetchall()
+        return [self._row_to_transcript_record(row) for row in rows]
+
+    def search_transcript_records(
+        self,
+        *,
+        query: str,
+        agent_id: str = "",
+        project: str = "",
+        session_id: str = "",
+        limit: int = 25,
+    ) -> list[ReplayHit]:
+        query_text = query.strip()
+        if not query_text:
+            return []
+        return self._query_replay_hits(
+            query=self._expand_query_aliases(query_text),
+            max_hits=max(1, int(limit)),
+            agent_id=agent_id,
+            project=project,
+            session_id=session_id,
+        )
 
     def _next_transcript_turn_index(self, connection: sqlite3.Connection, *, session_id: str) -> int:
         row = connection.execute(
@@ -5137,10 +5693,12 @@ class MemoryGraph:
         turn_index: int,
         role: str,
         transcript_text: str,
+        turn_pair_id: str = "",
         metadata: dict[str, Any] | None = None,
         message_identity: str | None = None,
     ) -> bool:
         """Insert a transcript record.  Returns True if written, False if skipped (dedup)."""
+        embedding, embedding_model_id, embedding_dim = self._embed_with_metadata(transcript_text)
         record = TranscriptRecord(
             tenant_id=self.tenant_id,
             agent_id=agent_id,
@@ -5150,16 +5708,19 @@ class MemoryGraph:
             turn_index=turn_index,
             role=role,
             transcript_text=transcript_text,
+            embedding_model_id=embedding_model_id,
+            embedding_dim=embedding_dim,
+            content_hash=_normalized_content_hash(transcript_text),
+            turn_pair_id=turn_pair_id,
             metadata=metadata or {},
         )
-        embedding = self.embedding_model.embed(record.transcript_text)
         cursor = connection.execute(
             """
             INSERT OR IGNORE INTO transcript_records (
                 id, tenant_id, agent_id, project, session_id, observed_at, turn_index, role,
-                transcript_text, embedding, metadata, message_identity
+                transcript_text, embedding, embedding_model_id, embedding_dim, content_hash, turn_pair_id, metadata, message_identity
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.id,
@@ -5172,6 +5733,10 @@ class MemoryGraph:
                 record.role,
                 record.transcript_text,
                 self.embedding_model.to_bytes(embedding),
+                record.embedding_model_id,
+                record.embedding_dim,
+                record.content_hash,
+                record.turn_pair_id,
                 _encode_metadata(record.metadata),
                 message_identity,
             ),
@@ -5198,7 +5763,8 @@ class MemoryGraph:
         valid_to = self._parse_optional_datetime(document.frontmatter.get("valid_to"))
         evidence_records = evidence_from_lines(document.evidence_lines)
         content = document.content.strip() or document.label
-        embedding_bytes = self.embedding_model.to_bytes(self.embedding_model.embed(content))
+        embedding_vector, embedding_model_id, embedding_dim = self._embed_with_metadata(content)
+        embedding_bytes = self.embedding_model.to_bytes(embedding_vector)
         if row is None:
             created_at = self._parse_optional_datetime(document.frontmatter.get("created_at")) or utc_now()
             updated_at = utc_now()
@@ -5212,6 +5778,8 @@ class MemoryGraph:
                 content=content,
                 node_type=node_type,
                 tags=tags,
+                embedding_model_id=embedding_model_id,
+                embedding_dim=embedding_dim,
                 evidence_records=evidence_records,
                 valid_from=valid_from,
                 valid_to=valid_to,
@@ -5222,9 +5790,9 @@ class MemoryGraph:
                 """
                 INSERT INTO nodes (
                     id, tenant_id, agent_id, project, session_id, label, content, node_type, tags, metadata, embedding,
-                    source_prompt, evidence_records, valid_from, valid_to, created_at, updated_at, access_count
+                    embedding_model_id, embedding_dim, source_prompt, source_turn_pair_id, evidence_records, valid_from, valid_to, created_at, updated_at, access_count
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     node.id,
@@ -5238,6 +5806,9 @@ class MemoryGraph:
                     json.dumps(node.tags),
                     _encode_metadata(node.metadata),
                     embedding_bytes,
+                    node.embedding_model_id,
+                    node.embedding_dim,
+                    "",
                     "",
                     _encode_evidence_records(node.evidence_records),
                     node.valid_from.isoformat() if node.valid_from is not None else None,
@@ -5262,6 +5833,9 @@ class MemoryGraph:
             node_type=node_type,
             tags=tags,
             source_prompt=existing.source_prompt,
+            embedding_model_id=embedding_model_id,
+            embedding_dim=embedding_dim,
+            source_turn_pair_id=existing.source_turn_pair_id,
             metadata=existing.metadata,
             evidence_records=evidence_records or existing.evidence_records,
             valid_from=valid_from,
@@ -5274,7 +5848,7 @@ class MemoryGraph:
             """
             UPDATE nodes
             SET agent_id = ?, project = ?, session_id = ?, label = ?, content = ?, node_type = ?, tags = ?,
-                metadata = ?, embedding = ?, evidence_records = ?, valid_from = ?, valid_to = ?, updated_at = ?
+                metadata = ?, embedding = ?, embedding_model_id = ?, embedding_dim = ?, evidence_records = ?, valid_from = ?, valid_to = ?, updated_at = ?
             WHERE id = ? AND tenant_id = ?
             """,
             (
@@ -5287,6 +5861,8 @@ class MemoryGraph:
                 json.dumps(node.tags),
                 _encode_metadata(node.metadata),
                 embedding_bytes,
+                node.embedding_model_id,
+                node.embedding_dim,
                 _encode_evidence_records(node.evidence_records),
                 node.valid_from.isoformat() if node.valid_from is not None else None,
                 node.valid_to.isoformat() if node.valid_to is not None else None,
@@ -5306,6 +5882,9 @@ class MemoryGraph:
         agent_id: str,
         session_id: str,
     ) -> Node:
+        embedding_vector, embedding_model_id, embedding_dim = self._embed_with_metadata(
+            f"Stub node imported from vault for {label}."
+        )
         node = Node(
             tenant_id=self.tenant_id,
             agent_id=agent_id,
@@ -5315,14 +5894,16 @@ class MemoryGraph:
             content=f"Stub node imported from vault for {label}.",
             node_type=NodeType.NOTE,
             tags=["stub", "vault-import"],
+            embedding_model_id=embedding_model_id,
+            embedding_dim=embedding_dim,
         )
         connection.execute(
             """
             INSERT INTO nodes (
                 id, tenant_id, agent_id, project, session_id, label, content, node_type, tags, metadata, embedding,
-                source_prompt, evidence_records, valid_from, valid_to, created_at, updated_at, access_count
+                embedding_model_id, embedding_dim, source_prompt, source_turn_pair_id, evidence_records, valid_from, valid_to, created_at, updated_at, access_count
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 node.id,
@@ -5335,7 +5916,10 @@ class MemoryGraph:
                 node.node_type.value,
                 json.dumps(node.tags),
                 _encode_metadata(node.metadata),
-                self.embedding_model.to_bytes(self.embedding_model.embed(node.content)),
+                self.embedding_model.to_bytes(embedding_vector),
+                node.embedding_model_id,
+                node.embedding_dim,
+                "",
                 "",
                 _encode_evidence_records([]),
                 None,
@@ -6071,11 +6655,23 @@ class MemoryGraph:
             (edge_id, self.tenant_id),
         ).fetchone()
 
-    def _build_backup_snapshot(self, connection: sqlite3.Connection) -> dict[str, Any]:
+    def _fetch_transcript_row(self, connection: sqlite3.Connection, transcript_id: str) -> sqlite3.Row | None:
+        return connection.execute(
+            """
+            SELECT id, tenant_id, agent_id, project, session_id, observed_at, turn_index, role, transcript_text,
+                   embedding, embedding_model_id, embedding_dim, content_hash, turn_pair_id, metadata
+            FROM transcript_records
+            WHERE id = ? AND tenant_id = ?
+            """,
+            (transcript_id, self.tenant_id),
+        ).fetchone()
+
+    def _build_backup_snapshot(self, connection: sqlite3.Connection, *, include_embeddings: bool = False) -> dict[str, Any]:
         node_rows = connection.execute(
             """
-            SELECT id, tenant_id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, source_prompt, metadata,
-                   evidence_records, valid_from, valid_to, created_at, updated_at, access_count
+            SELECT id, tenant_id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, source_prompt,
+                   embedding_model_id, embedding_dim, source_turn_pair_id, metadata,
+                   evidence_records, valid_from, valid_to, created_at, updated_at, access_count, embedding
             FROM nodes
             WHERE tenant_id = ?
             ORDER BY created_at ASC
@@ -6118,9 +6714,20 @@ class MemoryGraph:
             """,
             (self.tenant_id,),
         ).fetchall()
-        return {
+        transcript_rows = connection.execute(
+            """
+            SELECT id, tenant_id, agent_id, project, session_id, observed_at, turn_index, role, transcript_text,
+                   embedding, embedding_model_id, embedding_dim, content_hash, turn_pair_id, metadata
+            FROM transcript_records
+            WHERE tenant_id = ?
+            ORDER BY observed_at ASC, turn_index ASC
+            """,
+            (self.tenant_id,),
+        ).fetchall()
+        snapshot = {
             "schema_version": SCHEMA_VERSION,
             "tenant_id": self.tenant_id,
+            "embedding_model_id": self._current_embedding_model_id(),
             "repos": [
                 {
                     "id": row["id"],
@@ -6175,6 +6782,9 @@ class MemoryGraph:
                     "node_type": row["node_type"],
                     "tags": json.loads(row["tags"] or "[]"),
                     "source_prompt": row["source_prompt"] or "",
+                    "embedding_model_id": row["embedding_model_id"] or "",
+                    "embedding_dim": int(row["embedding_dim"] or 0),
+                    "source_turn_pair_id": row["source_turn_pair_id"] or "",
                     "metadata": _decode_metadata(row["metadata"]),
                     "evidence_records": [record.model_dump(mode="json") for record in _decode_evidence_records(row["evidence_records"])],
                     "valid_from": row["valid_from"],
@@ -6182,6 +6792,7 @@ class MemoryGraph:
                     "created_at": row["created_at"],
                     "updated_at": row["updated_at"],
                     "access_count": int(row["access_count"] or 0),
+                    "embedding": row["embedding"] if include_embeddings else None,
                 }
                 for row in node_rows
             ],
@@ -6198,17 +6809,45 @@ class MemoryGraph:
                 }
                 for row in edge_rows
             ],
+            "transcripts": [
+                {
+                    "id": row["id"],
+                    "tenant_id": row["tenant_id"],
+                    "agent_id": row["agent_id"] or "",
+                    "project": row["project"] or "",
+                    "session_id": row["session_id"] or "",
+                    "observed_at": row["observed_at"],
+                    "turn_index": int(row["turn_index"] or 0),
+                    "role": row["role"] or "",
+                    "transcript_text": row["transcript_text"],
+                    "embedding_model_id": row["embedding_model_id"] or "",
+                    "embedding_dim": int(row["embedding_dim"] or 0),
+                    "content_hash": row["content_hash"] or "",
+                    "turn_pair_id": row["turn_pair_id"] or "",
+                    "metadata": _decode_metadata(row["metadata"]),
+                    "embedding": row["embedding"] if include_embeddings else None,
+                }
+                for row in transcript_rows
+            ],
         }
+        if include_embeddings:
+            snapshot["embedding_dim"] = next((int(row["embedding_dim"] or 0) for row in node_rows if int(row["embedding_dim"] or 0)), 0)
+        return snapshot
 
     def _insert_snapshot_node(self, connection: sqlite3.Connection, raw_node: dict[str, Any]) -> None:
-        embedding = self.embedding_model.to_bytes(self.embedding_model.embed(raw_node["content"]))
+        embedding = raw_node.get("embedding")
+        embedding_model_id = str(raw_node.get("embedding_model_id", "") or "")
+        embedding_dim = int(raw_node.get("embedding_dim", 0) or 0)
+        if embedding is None:
+            embedding_vector, embedding_model_id, embedding_dim = self._embed_with_metadata(raw_node["content"])
+            embedding = self.embedding_model.to_bytes(embedding_vector)
         connection.execute(
             """
             INSERT INTO nodes (
                 id, tenant_id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, metadata, embedding,
-                source_prompt, evidence_records, valid_from, valid_to, created_at, updated_at, access_count
+                embedding_model_id, embedding_dim, source_prompt, source_turn_pair_id, evidence_records, valid_from, valid_to, created_at, updated_at, access_count
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 raw_node["id"],
@@ -6223,13 +6862,85 @@ class MemoryGraph:
                 json.dumps(raw_node.get("tags", [])),
                 _encode_metadata(raw_node.get("metadata", {})),
                 embedding,
+                embedding_model_id,
+                embedding_dim,
                 raw_node.get("source_prompt", ""),
+                raw_node.get("source_turn_pair_id", ""),
                 _encode_evidence_records([EvidenceRecord.model_validate(item) for item in raw_node.get("evidence_records", [])]),
                 raw_node.get("valid_from"),
                 raw_node.get("valid_to"),
                 raw_node["created_at"],
                 raw_node["updated_at"],
                 int(raw_node.get("access_count", 0)),
+            ),
+        )
+
+    def _insert_snapshot_transcript(self, connection: sqlite3.Connection, raw_transcript: dict[str, Any]) -> None:
+        embedding = raw_transcript.get("embedding")
+        embedding_model_id = str(raw_transcript.get("embedding_model_id", "") or "")
+        embedding_dim = int(raw_transcript.get("embedding_dim", 0) or 0)
+        if embedding is None:
+            embedding_vector, embedding_model_id, embedding_dim = self._embed_with_metadata(raw_transcript["transcript_text"])
+            embedding = self.embedding_model.to_bytes(embedding_vector)
+        connection.execute(
+            """
+            INSERT INTO transcript_records (
+                id, tenant_id, agent_id, project, session_id, observed_at, turn_index, role,
+                transcript_text, embedding, embedding_model_id, embedding_dim, content_hash, turn_pair_id, metadata, message_identity
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                raw_transcript["id"],
+                raw_transcript.get("tenant_id", self.tenant_id),
+                raw_transcript.get("agent_id", ""),
+                raw_transcript.get("project", ""),
+                raw_transcript.get("session_id", ""),
+                raw_transcript["observed_at"],
+                int(raw_transcript.get("turn_index", 0)),
+                raw_transcript.get("role", ""),
+                raw_transcript["transcript_text"],
+                embedding,
+                embedding_model_id,
+                embedding_dim,
+                raw_transcript.get("content_hash", _normalized_content_hash(raw_transcript["transcript_text"])),
+                raw_transcript.get("turn_pair_id", ""),
+                _encode_metadata(raw_transcript.get("metadata", {})),
+                None,
+            ),
+        )
+
+    def _update_snapshot_transcript(self, connection: sqlite3.Connection, raw_transcript: dict[str, Any]) -> None:
+        embedding = raw_transcript.get("embedding")
+        embedding_model_id = str(raw_transcript.get("embedding_model_id", "") or "")
+        embedding_dim = int(raw_transcript.get("embedding_dim", 0) or 0)
+        if embedding is None:
+            embedding_vector, embedding_model_id, embedding_dim = self._embed_with_metadata(raw_transcript["transcript_text"])
+            embedding = self.embedding_model.to_bytes(embedding_vector)
+        connection.execute(
+            """
+            UPDATE transcript_records
+            SET tenant_id = ?, agent_id = ?, project = ?, session_id = ?, observed_at = ?, turn_index = ?, role = ?,
+                transcript_text = ?, embedding = ?, embedding_model_id = ?, embedding_dim = ?, content_hash = ?, turn_pair_id = ?, metadata = ?
+            WHERE id = ? AND tenant_id = ?
+            """,
+            (
+                raw_transcript.get("tenant_id", self.tenant_id),
+                raw_transcript.get("agent_id", ""),
+                raw_transcript.get("project", ""),
+                raw_transcript.get("session_id", ""),
+                raw_transcript["observed_at"],
+                int(raw_transcript.get("turn_index", 0)),
+                raw_transcript.get("role", ""),
+                raw_transcript["transcript_text"],
+                embedding,
+                embedding_model_id,
+                embedding_dim,
+                raw_transcript.get("content_hash", _normalized_content_hash(raw_transcript["transcript_text"])),
+                raw_transcript.get("turn_pair_id", ""),
+                _encode_metadata(raw_transcript.get("metadata", {})),
+                raw_transcript["id"],
+                self.tenant_id,
             ),
         )
 
@@ -6322,12 +7033,17 @@ class MemoryGraph:
         )
 
     def _update_snapshot_node(self, connection: sqlite3.Connection, raw_node: dict[str, Any]) -> None:
-        embedding = self.embedding_model.to_bytes(self.embedding_model.embed(raw_node["content"]))
+        embedding = raw_node.get("embedding")
+        embedding_model_id = str(raw_node.get("embedding_model_id", "") or "")
+        embedding_dim = int(raw_node.get("embedding_dim", 0) or 0)
+        if embedding is None:
+            embedding_vector, embedding_model_id, embedding_dim = self._embed_with_metadata(raw_node["content"])
+            embedding = self.embedding_model.to_bytes(embedding_vector)
         connection.execute(
             """
             UPDATE nodes
             SET tenant_id = ?, agent_id = ?, project = ?, session_id = ?, context_window_id = ?, label = ?, content = ?, node_type = ?, tags = ?, metadata = ?, embedding = ?,
-                source_prompt = ?, evidence_records = ?, valid_from = ?, valid_to = ?,
+                embedding_model_id = ?, embedding_dim = ?, source_prompt = ?, source_turn_pair_id = ?, evidence_records = ?, valid_from = ?, valid_to = ?,
                 created_at = ?, updated_at = ?, access_count = ?
             WHERE id = ? AND tenant_id = ?
             """,
@@ -6343,7 +7059,10 @@ class MemoryGraph:
                 json.dumps(raw_node.get("tags", [])),
                 _encode_metadata(raw_node.get("metadata", {})),
                 embedding,
+                embedding_model_id,
+                embedding_dim,
                 raw_node.get("source_prompt", ""),
+                raw_node.get("source_turn_pair_id", ""),
                 _encode_evidence_records([EvidenceRecord.model_validate(item) for item in raw_node.get("evidence_records", [])]),
                 raw_node.get("valid_from"),
                 raw_node.get("valid_to"),

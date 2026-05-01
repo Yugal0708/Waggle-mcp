@@ -64,6 +64,98 @@ def test_load_oolong_examples_normalizes_list_answers(tmp_path: Path) -> None:
     assert examples[0].answer == "ham"
 
 
+def test_load_oolong_examples_accepts_upstream_real_rows(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "oolong-real.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "id": "3952f2d5-082f-14b2-5ec4-d9cbedd2f865",
+                "context_window_id": "e4fb38b9-ffca-0729-d52a-02fffd17610a",
+                "context_window_text": (
+                    "The following lines contains a single episode transcript of a Dungeons and Dragons game. "
+                    "[START OF EPISODE]\nBob rolled a 4.\n[END OF EPISODE]"
+                ),
+                "question": "Total number of rolls in this episode?",
+                "answer": "1",
+                "question_type": "singledoc_rolls",
+                "episodes": [1],
+                "campaign": "campaign2",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    examples = load_oolong_examples(dataset_path)
+
+    assert len(examples) == 1
+    assert examples[0].dataset_kind == "real"
+    assert examples[0].example_id == "3952f2d5-082f-14b2-5ec4-d9cbedd2f865"
+    assert examples[0].context_window_id == "e4fb38b9-ffca-0729-d52a-02fffd17610a"
+    assert examples[0].metadata["question_type"] == "singledoc_rolls"
+    assert examples[0].metadata["campaign"] == "campaign2"
+
+
+def test_load_oolong_examples_rejects_mixed_real_and_synth_rows(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "oolong-mixed.jsonl"
+    dataset_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "id": "real-1",
+                        "context_window_id": "ctx-real",
+                        "context_window_text": "[START OF EPISODE]\nBob likes coffee.\n[END OF EPISODE]",
+                        "question": "Which drink does Bob like?",
+                        "answer": "coffee",
+                        "question_type": "single_hop",
+                        "episodes": [1],
+                        "campaign": "campaign-a",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "id": "synth-1",
+                        "context_window_id": "ctx-synth",
+                        "context_window_text": "Example 1:\nText: The city of Paris is nice.\nUser: 101\nDate: 2026-04-03",
+                        "question": "Which users have locations?",
+                        "answer": "101",
+                        "answer_type": "list",
+                        "task_group": "oolong-pairs",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BenchmarkRuntimeError, match="Mixed OOLONG dataset shapes are not allowed"):
+        load_oolong_examples(dataset_path)
+
+
+def test_load_oolong_examples_rejects_explicit_real_kind_for_synth_rows(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "oolong-synth.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "example_id": "clean-0",
+                "context_window_id": "cw-clean-10000-user",
+                "context_window_text": "Example 1:\nText: The city of Paris is nice.\nUser: 101\nDate: 2026-04-03",
+                "question": "Which users have locations?",
+                "answer": "101",
+                "answer_type": "ANSWER_TYPE.USER",
+                "task_group": "user",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BenchmarkRuntimeError, match="not a valid upstream OOLONG-real record"):
+        load_oolong_examples(dataset_path, dataset_kind="real")
+
+
 def test_load_oolong_examples_rejects_unreachable_pair_gold(tmp_path: Path) -> None:
     dataset_path = tmp_path / "broken-oolong-pairs.jsonl"
     dataset_path.write_text(

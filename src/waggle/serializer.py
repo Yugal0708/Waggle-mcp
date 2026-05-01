@@ -41,7 +41,7 @@ def _format_updated_ago(timestamp: datetime) -> str:
 
 def serialize_subgraph(result: SubgraphResult) -> str:
     """Convert a subgraph result into readable text for an LLM."""
-    if result.retrieval_mode == "replay":
+    if result.retrieval_mode == "verbatim":
         if not result.replay_hits:
             return "=== Memory Replay Results: No results found ==="
         lines = [
@@ -53,6 +53,21 @@ def serialize_subgraph(result: SubgraphResult) -> str:
             lines.append(
                 f'• (session: {hit.session_id or "n/a"}, turn: {hit.turn_index}, role: {hit.role or "unknown"}) '
                 f'{hit.transcript_snippet or hit.transcript_text} [score={hit.score:.3f}]'
+            )
+        lines.extend(["", "=== End Results ==="])
+        return "\n".join(lines)
+
+    if result.retrieval_mode == "hybrid" and result.hybrid_hits:
+        lines = [
+            f"=== Hybrid Retrieval Results ({len(result.hybrid_hits)} hits) ===",
+            "",
+            "[TOP HITS]",
+        ]
+        for index, hit in enumerate(result.hybrid_hits, start=1):
+            reasoning = f" reason={hit.reasoning_from_reranker}" if hit.reasoning_from_reranker else ""
+            lines.append(
+                f"• #{index} [{hit.source}] {hit.content[:400]} [score={hit.score:.4f}] "
+                f"(turn_pair={hit.turn_pair_id or 'n/a'}, node_ids={hit.node_ids}){reasoning}"
             )
         lines.extend(["", "=== End Results ==="])
         return "\n".join(lines)

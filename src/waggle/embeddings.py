@@ -128,6 +128,11 @@ class EmbeddingModel:
         return f"{model.__class__.__module__}.{model.__class__.__name__}"
 
     @property
+    def model_id(self) -> str:
+        name = self.model_name.strip() or "unknown"
+        return f"{name}:{self.model_version}"
+
+    @property
     def model(self) -> Any:
         """Return the loaded model (or None if not yet ready / deterministic mode)."""
         if self.uses_deterministic_mode:
@@ -172,9 +177,11 @@ class EmbeddingModel:
         model = self._resolve_model(wait_timeout)
         if model is None:
             return np.asarray([self._embed_deterministically(t) for t in normalized], dtype=np.float32)
+        batch_size = min(64, max(1, len(normalized)))
         return np.asarray(
             model.encode(
                 normalized,
+                batch_size=batch_size,
                 normalize_embeddings=True,
                 convert_to_numpy=True,
             ),

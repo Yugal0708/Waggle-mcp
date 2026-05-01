@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import threading
 from collections import deque
@@ -12,6 +13,7 @@ import networkx as nx
 import numpy as np
 
 from waggle.abhi import (
+    ABHI_ENCRYPTION_ALGORITHM,
     ABHI_SPEC_VERSION,
     abhi_to_snapshot,
     dispatch_abhi_event,
@@ -477,6 +479,7 @@ class Neo4jMemoryGraph:
     def add_node(
         self,
         *,
+        node_id: str | None = None,
         label: str,
         content: str,
         node_type: NodeType,
@@ -489,7 +492,11 @@ class Neo4jMemoryGraph:
         valid_from: datetime | None = None,
         valid_to: datetime | None = None,
     ) -> NodeStoreResult:
+        node_kwargs: dict[str, Any] = {}
+        if node_id is not None and str(node_id).strip():
+            node_kwargs["id"] = str(node_id).strip()
         node = Node(
+            **node_kwargs,
             tenant_id=self.tenant_id,
             agent_id=agent_id,
             project=project,
@@ -562,13 +569,18 @@ class Neo4jMemoryGraph:
     def add_edge(
         self,
         *,
+        edge_id: str | None = None,
         source_id: str,
         target_id: str,
         relationship: str | RelationType,
         weight: float = 1.0,
         metadata: dict[str, Any] | None = None,
     ) -> Edge:
+        edge_kwargs: dict[str, Any] = {}
+        if edge_id is not None and str(edge_id).strip():
+            edge_kwargs["id"] = str(edge_id).strip()
         edge = Edge(
+            **edge_kwargs,
             tenant_id=self.tenant_id,
             source_id=source_id,
             target_id=target_id,
@@ -980,9 +992,9 @@ class Neo4jMemoryGraph:
             raise ValueError("max_nodes must be at least 1.")
         if max_depth < 0:
             raise ValueError("max_depth cannot be negative.")
-        normalized_mode = retrieval_mode.strip().lower()
-        if normalized_mode not in {"graph", "replay", "fusion"}:
-            raise ValidationFailure("retrieval_mode must be one of: graph, replay, fusion.")
+        normalized_mode = {"replay": "verbatim", "fusion": "hybrid"}.get(retrieval_mode.strip().lower(), retrieval_mode.strip().lower())
+        if normalized_mode not in {"graph", "verbatim", "hybrid"}:
+            raise ValidationFailure("retrieval_mode must be one of: graph, verbatim, hybrid.")
 
         graph_result = (
             self._query_graph_only(
@@ -993,7 +1005,7 @@ class Neo4jMemoryGraph:
                 project=project,
                 session_id=session_id,
             )
-            if normalized_mode in {"graph", "fusion"}
+            if normalized_mode in {"graph", "hybrid"}
             else None
         )
         replay_hits = (
@@ -1004,16 +1016,16 @@ class Neo4jMemoryGraph:
                 project=project,
                 session_id=session_id,
             )
-            if normalized_mode in {"replay", "fusion"}
+            if normalized_mode in {"verbatim", "hybrid"}
             else []
         )
         if normalized_mode == "graph":
             graph_result.retrieval_mode = "graph"
             return graph_result
-        if normalized_mode == "replay":
+        if normalized_mode == "verbatim":
             return SubgraphResult(
                 replay_hits=replay_hits,
-                retrieval_mode="replay",
+                retrieval_mode="verbatim",
                 query=query_text,
                 total_nodes_in_graph=graph_result.total_nodes_in_graph if graph_result is not None else 0,
             )
@@ -1023,7 +1035,7 @@ class Neo4jMemoryGraph:
             edges=graph_result.edges if graph_result is not None else [],
             replay_hits=replay_hits,
             fusion_hits=fusion_hits[:max_nodes],
-            retrieval_mode="fusion",
+            retrieval_mode="hybrid",
             query=query_text,
             total_nodes_in_graph=graph_result.total_nodes_in_graph if graph_result is not None else 0,
         )
@@ -1762,9 +1774,11 @@ class Neo4jMemoryGraph:
         project: str = "",
         agent_id: str = "",
         session_id: str = "",
+        include_embeddings: bool = False,
+        passphrase: str = "",
     ) -> AbhiExportResult:
         with self._lock, self._session() as session:
-            snapshot = self._build_backup_snapshot(session)
+            snapshot = self._build_backup_snapshot(session, include_embeddings=include_embeddings)
         snapshot["ui"] = self.get_ui_state(project=project, agent_id=agent_id, session_id=session_id)
         filtered = filter_snapshot_by_scope(snapshot, project=project, agent_id=agent_id, session_id=session_id)
         if output_path is None:
@@ -1773,7 +1787,7 @@ class Neo4jMemoryGraph:
             destination = self.export_dir / f"waggle-memory-{timestamp}.abhi"
         else:
             destination = Path(output_path).expanduser()
-        return write_abhi_document(filtered, output_path=destination)
+        return write_abhi_document(filtered, output_path=destination, passphrase=passphrase)
 
     def get_graph_snapshot(
         self,
@@ -1809,15 +1823,15 @@ class Neo4jMemoryGraph:
         normalized_mode = mode.strip().lower()
         normalized_format = format.strip().lower()
         normalized_audience = audience.strip().lower()
-        normalized_retrieval_mode = retrieval_mode.strip().lower()
+        normalized_retrieval_mode = {"replay": "verbatim", "fusion": "hybrid"}.get(retrieval_mode.strip().lower(), retrieval_mode.strip().lower())
         if normalized_mode not in {"prime", "query", "graph"}:
             raise ValidationFailure("mode must be one of: prime, query, graph.")
         if normalized_format not in {"markdown", "json", "both"}:
             raise ValidationFailure("format must be one of: markdown, json, both.")
         if normalized_audience not in {"llm", "human"}:
             raise ValidationFailure("audience must be one of: llm, human.")
-        if normalized_retrieval_mode not in {"graph", "replay", "fusion"}:
-            raise ValidationFailure("retrieval_mode must be one of: graph, replay, fusion.")
+        if normalized_retrieval_mode not in {"graph", "verbatim", "hybrid"}:
+            raise ValidationFailure("retrieval_mode must be one of: graph, verbatim, hybrid.")
         if normalized_mode == "query" and not query.strip():
             raise ValidationFailure("query is required when mode='query'.")
         if normalized_mode != "query" and normalized_retrieval_mode != "graph":
@@ -2128,19 +2142,19 @@ class Neo4jMemoryGraph:
         )
         return result
 
-    def validate_abhi(self, *, input_path: str | Path) -> AbhiValidationResult:
-        document = load_abhi_document(input_path)
+    def validate_abhi(self, *, input_path: str | Path, passphrase: str = "") -> AbhiValidationResult:
+        document = load_abhi_document(input_path, passphrase=passphrase)
         return validate_abhi_document(document, input_path=input_path)
 
-    def inspect_abhi(self, *, input_path: str | Path) -> AbhiInspectResult:
-        document = load_abhi_document(input_path)
+    def inspect_abhi(self, *, input_path: str | Path, passphrase: str = "") -> AbhiInspectResult:
+        document = load_abhi_document(input_path, passphrase=passphrase)
         return inspect_abhi_document(document, input_path=input_path)
 
     def diff_abhi(self, *, input_path_a: str | Path, input_path_b: str | Path) -> AbhiDiffResult:
         return diff_abhi_files(input_path_a=input_path_a, input_path_b=input_path_b)
 
-    def query_abhi(self, *, input_path: str | Path, query_id: str = "", query_text: str = "") -> AbhiQueryResult:
-        return query_abhi_file(input_path=input_path, query_id=query_id, query_text=query_text)
+    def query_abhi(self, *, input_path: str | Path, query_id: str = "", query_text: str = "", passphrase: str = "") -> AbhiQueryResult:
+        return query_abhi_file(input_path=input_path, query_id=query_id, query_text=query_text, passphrase=passphrase)
 
     def load_abhi_chunks(
         self,
@@ -2149,12 +2163,14 @@ class Neo4jMemoryGraph:
         chunk_ids: list[str] | None = None,
         query_id: str = "",
         query_text: str = "",
+        passphrase: str = "",
     ) -> AbhiChunkLoadResult:
         return load_abhi_chunk_file(
             input_path=input_path,
             chunk_ids=chunk_ids or [],
             query_id=query_id,
             query_text=query_text,
+            passphrase=passphrase,
         )
 
     def merge_abhi(
@@ -2174,9 +2190,9 @@ class Neo4jMemoryGraph:
             merge_strategy=merge_strategy,
         )
 
-    def import_abhi(self, *, input_path: str | Path) -> AbhiImportResult:
+    def import_abhi(self, *, input_path: str | Path, passphrase: str = "") -> AbhiImportResult:
         source = Path(input_path).expanduser()
-        document = load_abhi_document(source)
+        document = load_abhi_document(source, passphrase=passphrase)
         validation = validate_abhi_document(document, input_path=source)
         if not validation.valid:
             raise ValidationFailure("Invalid .abhi file: " + "; ".join(validation.errors))
@@ -2191,6 +2207,9 @@ class Neo4jMemoryGraph:
                 schema_version=int(snapshot.get("schema_version", 1)),
                 abhi_spec_version=validation.abhi_spec_version or ABHI_SPEC_VERSION,
                 hash_verified=True,
+                embedding_count=validation.embedding_count,
+                encrypted=bool(passphrase),
+                encryption_algorithm=ABHI_ENCRYPTION_ALGORITHM if passphrase else "",
                 executed_actions=executed_actions,
             )
             for raw_node in snapshot.get("nodes", []):
@@ -2776,6 +2795,58 @@ class Neo4jMemoryGraph:
         if normalized_session and record.session_id.strip().lower() != normalized_session:
             return False
         return True
+
+    def list_transcript_records(
+        self,
+        *,
+        agent_id: str = "",
+        project: str = "",
+        session_id: str = "",
+        limit: int = 200,
+    ) -> list[TranscriptRecord]:
+        filters = ["t.tenant_id = $tenant_id"]
+        params: dict[str, Any] = {"tenant_id": self.tenant_id, "limit": max(1, int(limit))}
+        if project.strip():
+            filters.append("t.project = $project")
+            params["project"] = project.strip()
+        if session_id.strip():
+            filters.append("t.session_id = $session_id")
+            params["session_id"] = session_id.strip()
+        elif agent_id.strip():
+            filters.append("t.agent_id = $agent_id")
+            params["agent_id"] = agent_id.strip()
+        with self._lock, self._session() as session:
+            records = session.run(
+                f"""
+                MATCH (t:MemoryTranscript)
+                WHERE {" AND ".join(filters)}
+                RETURN t
+                ORDER BY t.observed_at ASC, t.turn_index ASC
+                LIMIT $limit
+                """,
+                **params,
+            )
+            return [self._transcript_from_props(record["t"]) for record in records]
+
+    def search_transcript_records(
+        self,
+        *,
+        query: str,
+        agent_id: str = "",
+        project: str = "",
+        session_id: str = "",
+        limit: int = 25,
+    ) -> list[ReplayHit]:
+        query_text = query.strip()
+        if not query_text:
+            return []
+        return self._query_replay_hits(
+            query=self._expand_query_aliases(query_text),
+            max_hits=max(1, int(limit)),
+            agent_id=agent_id,
+            project=project,
+            session_id=session_id,
+        )
 
     def _next_transcript_turn_index(self, session: Any, *, session_id: str) -> int:
         record = session.run(
@@ -3446,22 +3517,28 @@ class Neo4jMemoryGraph:
             id=edge_id,
         ).single()
 
-    def _build_backup_snapshot(self, session: Any) -> dict[str, Any]:
+    def _build_backup_snapshot(self, session: Any, *, include_embeddings: bool = False) -> dict[str, Any]:
         nodes = [
             {
                 "id": props["id"],
                 "tenant_id": props.get("tenant_id") or self.tenant_id,
+                "agent_id": props.get("agent_id") or "",
+                "project": props.get("project") or "",
+                "session_id": props.get("session_id") or "",
+                "context_window_id": props.get("context_window_id"),
                 "label": props["label"],
                 "content": props["content"],
                 "node_type": props["node_type"],
                 "tags": list(props.get("tags") or []),
                 "source_prompt": props.get("source_prompt") or "",
+                "metadata": _decode_metadata(props.get("metadata")),
                 "evidence_records": [record.model_dump(mode="json") for record in _decode_evidence_records(props.get("evidence_records"))],
                 "valid_from": props.get("valid_from"),
                 "valid_to": props.get("valid_to"),
                 "created_at": props["created_at"],
                 "updated_at": props["updated_at"],
                 "access_count": int(props.get("access_count") or 0),
+                **({"embedding": base64.b64encode(np.array(props.get("embedding") or [], dtype=np.float32).astype(np.float32).tobytes()).decode("ascii")} if include_embeddings and props.get("embedding") else {}),
             }
             for props in (
                 record["n"]
@@ -3493,10 +3570,24 @@ class Neo4jMemoryGraph:
                 tenant_id=self.tenant_id,
             )
         ]
-        return {"schema_version": SCHEMA_VERSION, "tenant_id": self.tenant_id, "nodes": nodes, "edges": edges}
+        snapshot = {"schema_version": SCHEMA_VERSION, "tenant_id": self.tenant_id, "nodes": nodes, "edges": edges}
+        if include_embeddings:
+            snapshot["embeddings"] = {
+                node["id"]: node["embedding"]
+                for node in nodes
+                if node.get("embedding")
+            }
+            for node in nodes:
+                node.pop("embedding", None)
+        return snapshot
 
     def _insert_snapshot_node(self, session: Any, raw_node: dict[str, Any]) -> None:
-        embedding = self.embedding_model.embed(raw_node["content"]).astype(np.float32).tolist()
+        embedding_bytes = raw_node.get("embedding")
+        embedding = (
+            np.frombuffer(embedding_bytes, dtype=np.float32).astype(np.float32).tolist()
+            if isinstance(embedding_bytes, bytes)
+            else self.embedding_model.embed(raw_node["content"]).astype(np.float32).tolist()
+        )
         session.run(
             """
             CREATE (n:MemoryNode {
@@ -3523,7 +3614,12 @@ class Neo4jMemoryGraph:
         ).consume()
 
     def _update_snapshot_node(self, session: Any, raw_node: dict[str, Any]) -> None:
-        embedding = self.embedding_model.embed(raw_node["content"]).astype(np.float32).tolist()
+        embedding_bytes = raw_node.get("embedding")
+        embedding = (
+            np.frombuffer(embedding_bytes, dtype=np.float32).astype(np.float32).tolist()
+            if isinstance(embedding_bytes, bytes)
+            else self.embedding_model.embed(raw_node["content"]).astype(np.float32).tolist()
+        )
         session.run(
             """
             MATCH (n:MemoryNode {tenant_id: $existing_tenant_id, id: $id})

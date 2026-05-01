@@ -15,10 +15,12 @@ The goal is to measure the actual two-stage flow:
 
 The loader supports local exports that look like:
 
-- `Oolong-real`: rows containing fields such as `context_window_text`, `question`, `answer`, `question_type`, `context_window_id`
+- `Oolong-real`: the upstream `oolongbench/oolong-real` row shape with fields `id`, `context_window_id`, `context_window_text`, `question`, `answer`, `question_type`, plus optional metadata such as `episodes` and `campaign`
 - `Oolong-synth`: rows containing fields such as `context_window_text` or `context_window_text_with_labels`, `question`, `answer`, `answer_type`, `task_group`
 
 `answer` may be a plain string, JSON list, or Python-literal list string such as `['ham']`.
+
+Do not mix `Oolong-real` and `Oolong-synth` rows in the same input file; the loader now rejects mixed-shape datasets so a single run cannot silently combine upstream real rows with synthetic rows.
 
 ## Modes
 
