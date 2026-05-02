@@ -734,31 +734,26 @@ def format_summary_table(report: LongMemEvalReport) -> str:
 
 
 def _raw_candidate_order(question: str, entry: PreparedLongMemEvalEntry, question_embedding: np.ndarray, embedding_model: Any) -> list[PreparedLongMemEvalSession]:
-    session_scores = _combined_candidate_scores(
-        question,
-        entry,
-        question_embedding,
-        embedding_model,
-        semantic_weight=0.60,
-        lexical_weight=0.15,
-        temporal_weight=0.10,
-        coverage_weight=0.10,
-        quoted_weight=0.05,
-    )
-    if session_scores.size == 0:
+    semantic_scores = _vector_similarity_matrix(question_embedding, entry, embedding_model)
+    if semantic_scores.size == 0:
         return []
-    chunk_scores = _chunk_session_scores(question, entry)
-    fused_scores = np.asarray(
-        [
-            max(
-                float(session_score),
-                0.9 * chunk_scores.get(session.session_id, 0.0),
-            )
-            for session, session_score in zip(entry.sessions, session_scores, strict=True)
-        ],
+    lexical_scores = np.asarray(
+        [lexical_overlap(question, session.label, session.content) for session in entry.sessions],
         dtype=np.float32,
     )
-    ranked_indices = np.argsort(-fused_scores, kind="stable")
+    temporal_hints = infer_temporal_hints(question)
+    temporal_scores = np.zeros(len(entry.sessions), dtype=np.float32)
+    if temporal_hints.recency_mode != "default":
+        timestamps = np.asarray([session.updated_at.timestamp() for session in entry.sessions], dtype=np.float64)
+        max_timestamp = float(np.max(timestamps))
+        min_timestamp = float(np.min(timestamps))
+        span = max(max_timestamp - min_timestamp, 1.0)
+        if temporal_hints.recency_mode == "latest":
+            temporal_scores = np.asarray((timestamps - min_timestamp) / span, dtype=np.float32)
+        elif temporal_hints.recency_mode == "oldest":
+            temporal_scores = np.asarray((max_timestamp - timestamps) / span, dtype=np.float32)
+    combined_scores = (0.72 * semantic_scores) + (0.18 * lexical_scores) + (0.10 * temporal_scores)
+    ranked_indices = np.argsort(-combined_scores, kind="stable")
     return [entry.sessions[index] for index in ranked_indices]
 
 
