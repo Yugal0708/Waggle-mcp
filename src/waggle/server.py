@@ -35,7 +35,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from waggle import __version__
-from waggle.abhi import abhi_to_snapshot, build_abhi_document, execute_abhi_query, load_abhi_document, validate_abhi_document
+from waggle.abhi import abhi_to_snapshot, build_abhi_document, execute_abhi_query, load_abhi_document, validate_abhi_document, serialize_abhi_diff
 from waggle.config import AppConfig, STARTUP_MODE_FAST, STARTUP_MODE_STRICT
 from waggle.embeddings import EmbeddingModel, EMBEDDING_FREE_TOOLS, STATUS_READY, STATUS_DISABLED
 from waggle.errors import (
@@ -94,7 +94,6 @@ from waggle.recursive_context import (
 from waggle.serializer import (
     serialize_abhi_chunk_load,
     serialize_abhi_inspect,
-    serialize_abhi_diff,
     serialize_abhi_merge,
     serialize_abhi_query,
     serialize_abhi_validation,
