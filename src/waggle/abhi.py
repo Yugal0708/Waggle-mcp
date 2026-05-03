@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
+import logging
 import os
 import re
+import shutil
+import tempfile
 import zipfile
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -32,6 +38,16 @@ from waggle.models import (
 ABHI_SPEC_VERSION = "2.0.0"
 ABHI_MAJOR_VERSION = 2
 ABHI_ENCRYPTION_ALGORITHM = "aes-256-gcm"
+
+# Magic bytes prepended to every .abhi file: W G L \x01 (format version byte).
+# v0 = bare ZIP (no magic, legacy files written before this was introduced)
+# v1 = WGL\x01 prefix  ← current
+# The reader strips these 4 bytes before passing the payload to zipfile.
+# Bump the version byte (e.g. \x02) only when the ZIP layout itself changes in
+# a backwards-incompatible way.
+ABHI_MAGIC = b"\x57\x47\x4C\x01"  # W G L \x01
+ABHI_MAGIC_LEN = len(ABHI_MAGIC)
+_ABHI_ZIP_MAGIC = b"PK\x03\x04"  # standard ZIP local-file-header signature
 ABHI_SIGNATURE_ALGORITHM = "ed25519"
 ABHI_CHUNK_NODE_LIMIT = 64
 ABHI_TRANSCRIPTS_MEMBER = "transcripts.jsonl"
@@ -309,6 +325,8 @@ def build_abhi_document(
     include_embeddings: bool = True,
     redact_patterns: list[str] | None = None,
     encrypted: bool = False,
+    include_low_confidence_edges: bool = False,
+    low_confidence_threshold: float = 0.7,
 ) -> dict[str, Any]:
     redact_patterns = redact_patterns or []
     filtered = _scope_filter(
@@ -334,7 +352,30 @@ def build_abhi_document(
         "source_turn_pair_id",
         "updated_at",
     )
-    edges = _sorted_records([_normalize_edge(item) for item in filtered.get("edges", [])], "id", "source_id", "target_id", "relationship")
+    all_edges = _sorted_records([_normalize_edge(item) for item in filtered.get("edges", [])], "id", "source_id", "target_id", "relationship")
+
+    # Filter low-confidence RELATES_TO edges unless caller opts in.
+    edges_filtered_count = 0
+    if not include_low_confidence_edges:
+        kept: list[dict[str, Any]] = []
+        for edge in all_edges:
+            if str(edge.get("relationship", "")).lower() == "relates_to":
+                meta = edge.get("metadata") or {}
+                if isinstance(meta, str):
+                    try:
+                        import json as _json
+                        meta = _json.loads(meta)
+                    except Exception:
+                        meta = {}
+                confidence = float(meta.get("edge_confidence", 1.0))
+                if confidence < low_confidence_threshold:
+                    edges_filtered_count += 1
+                    continue
+            kept.append(edge)
+        edges = kept
+    else:
+        edges = all_edges
+
     context_windows = _sorted_records([_normalize_window(item) for item in filtered.get("context_windows", [])], "id", "session_id")
     repos = _sorted_records(list(filtered.get("repos", [])), "id", "name")
     context_window_edges = _sorted_records(list(filtered.get("context_window_edges", [])), "id", "source_window_id", "target_window_id", "edge_type")
@@ -356,7 +397,15 @@ def build_abhi_document(
         },
         "scope": scope,
         "includes_embeddings": include_embeddings,
-        "export_context": {},
+        "export_context": {
+            "edge_filter": {
+                "include_low_confidence_edges": include_low_confidence_edges,
+                "low_confidence_threshold": low_confidence_threshold,
+                "edges_total": len(all_edges),
+                "edges_exported": len(edges),
+                "edges_filtered": edges_filtered_count,
+            }
+        },
         "counts": {
             "transcripts": len(transcripts),
             "nodes": len(nodes),
@@ -434,6 +483,8 @@ def write_abhi_document(
     redact_patterns: list[str] | None = None,
     sign: bool = False,
     signing_key_dir: str | Path | None = None,
+    include_low_confidence_edges: bool = False,
+    low_confidence_threshold: float = 0.7,
 ) -> AbhiExportResult:
     destination = Path(output_path).expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -447,34 +498,50 @@ def write_abhi_document(
         include_embeddings=include_embeddings,
         redact_patterns=redact_patterns,
         encrypted=bool(passphrase),
+        include_low_confidence_edges=include_low_confidence_edges,
+        low_confidence_threshold=low_confidence_threshold,
     )
     manifest = document["manifest"]
-    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        _write_member(archive, manifest, ABHI_TRANSCRIPTS_MEMBER, _record_lines(document["transcripts"]), passphrase=passphrase)
-        _write_member(archive, manifest, ABHI_NODES_MEMBER, _record_lines(document["nodes"]), passphrase=passphrase)
-        _write_member(archive, manifest, ABHI_EDGES_MEMBER, _record_lines(document["edges"]), passphrase=passphrase)
-        _write_member(
-            archive,
-            manifest,
-            ABHI_CONTEXT_WINDOWS_MEMBER,
-            _record_lines(document["context_windows"]),
-            passphrase=passphrase,
-        )
-        if sign:
-            private_key, _ = _load_or_create_signing_key(signing_key_dir or "~/.waggle/keys")
-            signature = private_key.sign(_signature_payload(document))
-            public_key = private_key.public_key().public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    # Write the ZIP to a temp file first, then stream magic + ZIP to the final
+    # destination.  This avoids holding the entire archive in memory, which
+    # matters for large graphs (hundreds of MB of embeddings).
+    tmp_fd, tmp_path_str = tempfile.mkstemp(suffix=".abhi.tmp", dir=destination.parent)
+    tmp_path = Path(tmp_path_str)
+    try:
+        os.close(tmp_fd)
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            _write_member(archive, manifest, ABHI_TRANSCRIPTS_MEMBER, _record_lines(document["transcripts"]), passphrase=passphrase)
+            _write_member(archive, manifest, ABHI_NODES_MEMBER, _record_lines(document["nodes"]), passphrase=passphrase)
+            _write_member(archive, manifest, ABHI_EDGES_MEMBER, _record_lines(document["edges"]), passphrase=passphrase)
+            _write_member(
+                archive,
+                manifest,
+                ABHI_CONTEXT_WINDOWS_MEMBER,
+                _record_lines(document["context_windows"]),
+                passphrase=passphrase,
             )
-            _archive_writestr(archive, ABHI_SIGNATURE_MEMBER, signature)
-            _archive_writestr(archive, ABHI_PUBLIC_KEY_MEMBER, public_key)
-            manifest["signatures"] = {
-                "algorithm": ABHI_SIGNATURE_ALGORITHM,
-                "present": True,
-            }
-        manifest["content_hash"] = _hash_with_prefix(compute_abhi_hash(document))
-        _archive_writestr(archive, ABHI_MANIFEST_MEMBER, _canonical_json(manifest))
+            if sign:
+                private_key, _ = _load_or_create_signing_key(signing_key_dir or "~/.waggle/keys")
+                signature = private_key.sign(_signature_payload(document))
+                public_key = private_key.public_key().public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+                _archive_writestr(archive, ABHI_SIGNATURE_MEMBER, signature)
+                _archive_writestr(archive, ABHI_PUBLIC_KEY_MEMBER, public_key)
+                manifest["signatures"] = {
+                    "algorithm": ABHI_SIGNATURE_ALGORITHM,
+                    "present": True,
+                }
+            manifest["content_hash"] = _hash_with_prefix(compute_abhi_hash(document))
+            _archive_writestr(archive, ABHI_MANIFEST_MEMBER, _canonical_json(manifest))
+        # Stream magic bytes + ZIP content to the final destination.
+        with destination.open("wb") as out_fh:
+            out_fh.write(ABHI_MAGIC)
+            with tmp_path.open("rb") as zip_fh:
+                shutil.copyfileobj(zip_fh, out_fh)
+    finally:
+        tmp_path.unlink(missing_ok=True)
     return AbhiExportResult(
         output_path=str(destination),
         tenant_id=str(manifest.get("tenant", "")),
@@ -487,12 +554,41 @@ def write_abhi_document(
         encrypted=bool(passphrase),
         encryption_algorithm=ABHI_ENCRYPTION_ALGORITHM if passphrase else "",
         executed_actions=[],
+        export_context=dict(manifest.get("export_context", {})),
     )
 
 
 def load_abhi_document(input_path: str | Path, passphrase: str = "") -> dict[str, Any]:
     source = Path(input_path).expanduser()
-    with zipfile.ZipFile(source, "r") as archive:
+    raw = source.read_bytes()
+
+    # --- Format detection ---
+    # Guard against truncated / empty files before slicing.
+    if len(raw) < 4:
+        raise ValidationFailure(
+            f"{source} is not a valid .abhi file (file is too short or empty)."
+        )
+
+    header = raw[:ABHI_MAGIC_LEN]
+    if header == ABHI_MAGIC:
+        # v1: Waggle magic prefix present — strip it and open the ZIP payload.
+        zip_source: str | Path | io.BytesIO = io.BytesIO(raw[ABHI_MAGIC_LEN:])
+    elif raw[:4] == _ABHI_ZIP_MAGIC:
+        # v0: bare ZIP written before magic bytes were introduced.
+        # Warn so users know to re-export with a current Waggle client.
+        logger.warning(
+            "%s is a legacy v0 .abhi file (no magic bytes). "
+            "Re-export with Waggle 0.1.15+ to upgrade to the v1 format.",
+            source,
+        )
+        zip_source = source
+    else:
+        raise ValidationFailure(
+            f"{source} is not a valid .abhi file. "
+            "The file may be corrupt or was not exported by a Waggle MCP client."
+        )
+
+    with zipfile.ZipFile(zip_source, "r") as archive:
         if ABHI_MANIFEST_MEMBER not in archive.namelist():
             raise ValidationFailure(f"{source} is missing {ABHI_MANIFEST_MEMBER}.")
         manifest = json.loads(archive.read(ABHI_MANIFEST_MEMBER).decode("utf-8"))
