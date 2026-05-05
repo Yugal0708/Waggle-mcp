@@ -1,27 +1,27 @@
 {
   "warning": "This benchmark follows the benchmark families used in the RLM paper, but uses deterministic synthetic memory tasks. Do not compare numerically to the RLM paper.",
-  "total_cases": 45,
+  "total_cases": 36,
   "families": {
     "BrowseComp-Plus-style": {
       "build_context": {
         "avg_score": 1.0,
         "avg_f1": 1.0,
         "avg_tokens": 193.0,
-        "avg_latency_ms": 10.566666666666668,
+        "avg_latency_ms": 8.299999999999999,
         "count": 3
       },
       "query_graph": {
         "avg_score": 1.0,
         "avg_f1": 1.0,
         "avg_tokens": 98.0,
-        "avg_latency_ms": 1.3333333333333333,
+        "avg_latency_ms": 1.2666666666666666,
         "count": 3
       },
       "raw_context": {
         "avg_score": 1.0,
         "avg_f1": 1.0,
         "avg_tokens": 175.0,
-        "avg_latency_ms": 1.0,
+        "avg_latency_ms": 0.9666666666666668,
         "count": 3
       }
     },
@@ -30,44 +30,21 @@
         "avg_score": 1.0,
         "avg_f1": 1.0,
         "avg_tokens": 616.3333333333334,
-        "avg_latency_ms": 188.76666666666665,
+        "avg_latency_ms": 210.20000000000002,
         "count": 3
       },
       "query_graph": {
         "avg_score": 1.0,
         "avg_f1": 1.0,
         "avg_tokens": 168.66666666666666,
-        "avg_latency_ms": 27.599999999999998,
+        "avg_latency_ms": 28.233333333333334,
         "count": 3
       },
       "raw_context": {
         "avg_score": 0.0,
         "avg_f1": 0.5,
         "avg_tokens": 1394.0,
-        "avg_latency_ms": 15.166666666666666,
-        "count": 3
-      }
-    },
-    "OOLONG-Pairs-style": {
-      "build_context": {
-        "avg_score": 1.0,
-        "avg_f1": 1.0,
-        "avg_tokens": 497.0,
-        "avg_latency_ms": 121.96666666666668,
-        "count": 3
-      },
-      "query_graph": {
-        "avg_score": 0.0,
-        "avg_f1": 0.0,
-        "avg_tokens": 98.0,
-        "avg_latency_ms": 26.0,
-        "count": 3
-      },
-      "raw_context": {
-        "avg_score": 0.0,
-        "avg_f1": 0.0,
-        "avg_tokens": 1406.3333333333333,
-        "avg_latency_ms": 14.0,
+        "avg_latency_ms": 16.0,
         "count": 3
       }
     },
@@ -76,21 +53,21 @@
         "avg_score": 0.26853886053886056,
         "avg_f1": 0.26853886053886056,
         "avg_tokens": 326.0,
-        "avg_latency_ms": 132.70000000000002,
+        "avg_latency_ms": 126.2,
         "count": 3
       },
       "query_graph": {
         "avg_score": 0.09598301826373966,
         "avg_f1": 0.09598301826373966,
         "avg_tokens": 81.0,
-        "avg_latency_ms": 35.46666666666667,
+        "avg_latency_ms": 26.633333333333336,
         "count": 3
       },
       "raw_context": {
         "avg_score": 0.429164360819037,
         "avg_f1": 0.429164360819037,
         "avg_tokens": 1430.3333333333333,
-        "avg_latency_ms": 18.933333333333334,
+        "avg_latency_ms": 14.466666666666667,
         "count": 3
       }
     },
@@ -99,21 +76,21 @@
         "avg_score": 1.0,
         "avg_f1": 1.0,
         "avg_tokens": 194.66666666666666,
-        "avg_latency_ms": 114.96666666666665,
+        "avg_latency_ms": 109.90000000000002,
         "count": 3
       },
       "query_graph": {
         "avg_score": 1.0,
         "avg_f1": 1.0,
         "avg_tokens": 93.33333333333333,
-        "avg_latency_ms": 23.899999999999995,
+        "avg_latency_ms": 23.23333333333333,
         "count": 3
       },
       "raw_context": {
         "avg_score": 1.0,
         "avg_f1": 1.0,
         "avg_tokens": 1432.3333333333333,
-        "avg_latency_ms": 13.633333333333333,
+        "avg_latency_ms": 14.199999999999998,
         "count": 3
       }
     }

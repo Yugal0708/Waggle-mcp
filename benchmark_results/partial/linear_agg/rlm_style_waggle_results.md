@@ -7,15 +7,15 @@
 
 | Benchmark family | Scale | Method | Score | F1 | Ev. Coverage | Tokens returned | Latency (ms) |
 |---|---:|---|---:|---:|---:|---:|---:|
-| OOLONG-style | 128 | raw_context | 0.885 | 0.885 | 0.793 | 1416 | 3 |
-| OOLONG-style | 128 | query_graph | 0.242 | 0.242 | 0.138 | 81 | 5 |
-| OOLONG-style | 128 | build_context | 0.513 | 0.513 | 0.345 | 251 | 22 |
+| OOLONG-style | 128 | raw_context | 0.885 | 0.885 | 0.793 | 1416 | 5 |
+| OOLONG-style | 128 | query_graph | 0.242 | 0.242 | 0.138 | 81 | 6 |
+| OOLONG-style | 128 | build_context | 0.513 | 0.513 | 0.345 | 251 | 32 |
 | OOLONG-style | 512 | raw_context | 0.403 | 0.403 | 0.252 | 1425 | 8 |
 | OOLONG-style | 512 | query_graph | 0.035 | 0.035 | 0.018 | 81 | 15 |
 | OOLONG-style | 512 | build_context | 0.224 | 0.224 | 0.126 | 355 | 81 |
-| OOLONG-style | 2048 | raw_context | 0.000 | 0.000 | 0.000 | 1450 | 46 |
-| OOLONG-style | 2048 | query_graph | 0.010 | 0.010 | 0.005 | 81 | 86 |
-| OOLONG-style | 2048 | build_context | 0.069 | 0.069 | 0.036 | 372 | 296 |
+| OOLONG-style | 2048 | raw_context | 0.000 | 0.000 | 0.000 | 1450 | 31 |
+| OOLONG-style | 2048 | query_graph | 0.010 | 0.010 | 0.005 | 81 | 58 |
+| OOLONG-style | 2048 | build_context | 0.069 | 0.069 | 0.036 | 372 | 266 |
 
 ## Token efficiency: build_context vs baselines
 

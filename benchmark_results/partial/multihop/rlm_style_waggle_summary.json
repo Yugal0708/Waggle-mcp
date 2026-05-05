@@ -7,21 +7,21 @@
         "avg_score": 1.0,
         "avg_f1": 1.0,
         "avg_tokens": 175.0,
-        "avg_latency_ms": 1.0,
+        "avg_latency_ms": 0.9666666666666668,
         "count": 3
       },
       "query_graph": {
         "avg_score": 1.0,
         "avg_f1": 1.0,
         "avg_tokens": 98.0,
-        "avg_latency_ms": 1.3333333333333333,
+        "avg_latency_ms": 1.2666666666666666,
         "count": 3
       },
       "build_context": {
         "avg_score": 1.0,
         "avg_f1": 1.0,
         "avg_tokens": 193.0,
-        "avg_latency_ms": 10.566666666666668,
+        "avg_latency_ms": 8.299999999999999,
         "count": 3
       }
     }
