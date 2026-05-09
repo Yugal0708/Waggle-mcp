@@ -38,7 +38,7 @@ waggle-mcp --help
 
 ## Project Architecture
 
-```
+```text
 src/waggle/
 ├── server.py           — MCP server, CLI entrypoint, all tool definitions
 ├── graph.py            — Core SQLite-backed graph engine (MemoryGraph)
@@ -58,7 +58,7 @@ src/waggle/
 
 ### Key Data Flow
 
-```
+```text
 observe_conversation()
     └─► intelligence.extract_conversation_candidates()
     └─► MemoryGraph.store_node() × N           ← SQLite write + embedding
@@ -169,7 +169,7 @@ The offline-safe embedding mode. Uses SHA-256 hashing to produce a 256-dim float
 
 ### Commit Message Style
 
-```
+```text
 <type>(<scope>): <short description>
 
 <optional body explaining why>
@@ -178,7 +178,7 @@ The offline-safe embedding mode. Uses SHA-256 hashing to produce a 256-dim float
 Types: `fix`, `feat`, `docs`, `test`, `refactor`, `ci`, `chore`
 
 Examples:
-```
+```text
 fix(docker): sync image version label with pyproject.toml
 feat(cli): add --dry-run flag to import and pull commands
 ci: add test workflow for Python 3.11-3.13
