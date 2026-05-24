@@ -104,6 +104,13 @@ For self-hosted production review and security posture:
 - [Hardening checklist](docs/security/hardening-checklist.md)
 - [Reference](docs/reference.md)
 
+## Contributing & Community
+
+- [Contributing guide](./CONTRIBUTING.md)
+- [Repository map](./docs/repository-map.md)
+- [Starter issues](./docs/good-first-issues.md)
+- [Label catalog](./.github/labels.yml)
+
 ---
 
 ## 60-Second Demo

@@ -7,6 +7,7 @@ Thank you for your interest in improving Waggle. This document covers everything
 ## Table of Contents
 
 - [Getting Started](#getting-started)
+- [First Contribution Paths](#first-contribution-paths)
 - [Project Architecture](#project-architecture)
 - [Running Tests](#running-tests)
 - [Code Style](#code-style)
@@ -33,6 +34,21 @@ pip install -e ".[dev]"
 # 4. Verify the setup
 waggle-mcp --help
 ```
+
+## First Contribution Paths
+
+If you are new to the repo, start here before picking an issue:
+
+- [`docs/repository-map.md`](./docs/repository-map.md) explains the important files and directories.
+- [`docs/good-first-issues.md`](./docs/good-first-issues.md) lists intentionally scoped starter tasks.
+- [`.github/labels.yml`](./.github/labels.yml) defines the label set maintainers should use for triage.
+
+### Labeling guidance
+
+- Use `good first issue` for small, well-scoped tasks with clear acceptance criteria.
+- Use `help wanted` for larger tasks that are still open to external contributors.
+- Add one domain label where possible, such as `graph`, `retrieval`, `windows`, `tooling`, or `documentation`.
+- New issues should usually start as `needs-triage` until a maintainer confirms scope and priority.
 
 ---
 

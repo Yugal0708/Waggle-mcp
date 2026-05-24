@@ -1,0 +1,48 @@
+- name: good first issue
+  color: "7057ff"
+  description: Small, well-scoped task suitable for first-time contributors.
+- name: help wanted
+  color: "008672"
+  description: Maintainers would welcome an external contribution here.
+- name: documentation
+  color: "0075ca"
+  description: Improvements to docs, examples, or contributor guidance.
+- name: bug
+  color: "d73a4a"
+  description: Something is broken or behaving incorrectly.
+- name: enhancement
+  color: "a2eeef"
+  description: New feature or meaningful product improvement.
+- name: testing
+  color: "bfd4f2"
+  description: Test coverage, fixtures, or CI-related work.
+- name: tooling
+  color: "5319e7"
+  description: Developer tooling, scripts, release flows, or packaging work.
+- name: onboarding
+  color: "fbca04"
+  description: Contributor experience, setup, or newcomer ergonomics.
+- name: performance
+  color: "c2e0c6"
+  description: Retrieval speed, token efficiency, or runtime performance.
+- name: graph
+  color: "1d76db"
+  description: Graph storage, traversal, scoping, or edge semantics.
+- name: retrieval
+  color: "0e8a16"
+  description: Ranking, search quality, embeddings, or hybrid retrieval.
+- name: windows
+  color: "c5def5"
+  description: Windows-specific behavior or compatibility.
+- name: release
+  color: "f9d0c4"
+  description: Packaging, publishing, extensions, or release automation.
+- name: security
+  color: "b60205"
+  description: Security posture, secret handling, or hardening.
+- name: needs-triage
+  color: "ededed"
+  description: New issue that still needs maintainer classification.
+- name: blocked
+  color: "000000"
+  description: Work cannot proceed until an external dependency or decision lands.

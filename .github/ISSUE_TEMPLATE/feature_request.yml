@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a new capability or improvement.
+title: "[feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do that Waggle does not support well today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the change you want.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds, related tools, or reasons this should not be done another way.
+  - type: textarea
+    id: scope
+    attributes:
+      label: Suggested implementation scope
+      description: Mention likely files, modules, or commands if you know them.
+      placeholder: src/waggle/server.py, docs/install/, tests/test_server.py

@@ -1,0 +1,25 @@
+name: Documentation improvement
+description: Report missing, confusing, or outdated documentation.
+title: "[docs] "
+labels:
+  - documentation
+body:
+  - type: textarea
+    id: gap
+    attributes:
+      label: Documentation gap
+      description: What is missing or unclear?
+    validations:
+      required: true
+  - type: input
+    id: source
+    attributes:
+      label: Relevant page or file
+      placeholder: README.md, docs/install/codex.md, CONTRIBUTING.md
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed improvement
+      description: What should the docs say or show instead?
+    validations:
+      required: true
