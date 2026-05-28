@@ -668,6 +668,7 @@ def test_graph_create_edge_rejects_invalid_weight(tmp_path: Path) -> None:
             headers=headers,
         )
         assert resp.status_code == 400
+        assert "numeric" in resp.json()["message"].lower()
 
         resp = client.post(
             "/api/graph/edges",
@@ -680,6 +681,7 @@ def test_graph_create_edge_rejects_invalid_weight(tmp_path: Path) -> None:
             headers=headers,
         )
         assert resp.status_code == 400
+        assert "numeric" in resp.json()["message"].lower()
 
         resp = client.post(
             "/api/graph/edges",
@@ -692,6 +694,7 @@ def test_graph_create_edge_rejects_invalid_weight(tmp_path: Path) -> None:
             headers=headers,
         )
         assert resp.status_code == 400
+        assert "numeric" in resp.json()["message"].lower()
 
         resp = client.post(
             "/api/graph/edges",
@@ -739,6 +742,7 @@ def test_graph_update_edge_rejects_invalid_weight(tmp_path: Path) -> None:
             headers=headers,
         )
         assert resp.status_code == 400
+        assert "numeric" in resp.json()["message"].lower()
 
         resp = client.patch(
             f"/api/graph/edges/{edge.id}",
@@ -746,6 +750,15 @@ def test_graph_update_edge_rejects_invalid_weight(tmp_path: Path) -> None:
             headers=headers,
         )
         assert resp.status_code == 400
+        assert "numeric" in resp.json()["message"].lower()
+
+        resp = client.patch(
+            f"/api/graph/edges/{edge.id}",
+            json={"weight": "bad"},
+            headers=headers,
+        )
+        assert resp.status_code == 400
+        assert "numeric" in resp.json()["message"].lower()
 
         resp = client.patch(
             f"/api/graph/edges/{edge.id}",
