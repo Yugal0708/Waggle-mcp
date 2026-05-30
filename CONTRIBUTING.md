@@ -4,16 +4,17 @@ Thank you for your interest in improving Waggle. This document covers everything
 
 ---
 
+
 ## Table of Contents
 
 - [Getting Started](#getting-started)
 - [First Contribution Paths](#first-contribution-paths)
 - [Project Architecture](#project-architecture)
 - [Running Tests](#running-tests)
+- [Writing Tests](#writing-tests)      <-- ADD THIS LINE
 - [Code Style](#code-style)
 - [Key Concepts](#key-concepts)
 - [How to Submit a PR](#how-to-submit-a-pr)
-
 ---
 
 ## Getting Started
@@ -224,14 +225,16 @@ The offline-safe embedding mode. Uses SHA-256 hashing to produce a 256-dim float
 6. **Benchmark changes:** If your PR affects retrieval quality or token efficiency, include updated artifact links under `tests/artifacts/`.
 7. **Open the PR** — CI will run automatically and the maintainer will review.
 
+
 ### Pull Request Format
 
 Use the repository PR template and keep these sections complete:
 
-- Summary: concise bullets describing the user-visible or maintainer-visible change.
-- Testing: exact commands run, or a clear reason when a check was not run.
-- Checklist: issue link, docs impact, focused scope, and confirmation that no secrets or generated noise were committed.
-- Implementation notes: for non-trivial code, include a short walkthrough of the approach so reviewers can tell that you understand the change.
+- **Summary**: Concise bullets describing the user-visible or maintainer-visible change.
+- **Testing**: Exact commands run to verify the change.
+- **Test report**: Proof that the test suite is passing (e.g., a screenshot).
+- **Checklist**: Confirmation of issue linking, docs updates, and focused scope.
+- **Implementation notes**: For non-trivial code, include a short walkthrough of the approach.
 
 Maintainers may ask you to explain your implementation before approval. PRs that cannot be explained by the contributor will not be merged.
 
