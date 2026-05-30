@@ -390,6 +390,17 @@ A reusable copy also lives in [automatic-memory-rules.md](./automatic-memory-rul
 |----------|---------|-------------|
 | `WAGGLE_DB_PATH` | `~/.waggle/waggle.db` | path to the SQLite file |
 
+### Database Path Resolution
+
+When using the SQLite backend, Waggle determines the database path in the following order:
+
+1. `WAGGLE_DB_PATH` if it is explicitly set.
+2. `mcp_servers.waggle.env.WAGGLE_DB_PATH` from `~/.codex/config.toml` (only when `WAGGLE_DB_PATH` is not set).
+3. The default path: `~/.waggle/waggle.db`.
+
+The `~` character is expanded to the current user's home directory.
+To force Waggle to use a specific database location, set `WAGGLE_DB_PATH` explicitly.
+
 ### HTTP service
 
 | Variable | Default | Description |
