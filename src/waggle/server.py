@@ -1554,10 +1554,7 @@ class WaggleServer:
         graph = self.current_graph()
         started = time.perf_counter()
         graph.ensure_tenant(graph.tenant_id)
-        if (
-            self.config.api_key_environment == "live"
-            and self.config.default_tenant_id == "local-default"
-        ):
+        if self.config.api_key_environment == "live" and self.config.default_tenant_id == "local-default":
             LOGGER.warning(
                 "WAGGLE_API_KEY_ENVIRONMENT is set to 'live' but "
                 "WAGGLE_DEFAULT_TENANT_ID is still 'local-default'. "
