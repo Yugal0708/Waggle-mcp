@@ -29,6 +29,8 @@ from waggle.server import (
     _write_other,
 )
 
+ABHI_FIXTURES = Path(__file__).parent / "fixtures" / "abhi"
+
 
 class FakeEmbeddingModel:
     model_name = "fake-model"
@@ -83,9 +85,21 @@ def make_app(tmp_path: Path) -> WaggleServer:
     return WaggleServer(graph=graph, config=config)
 
 
+def _seed_transcript_fixture(app: WaggleServer, fixture_name: str) -> None:
+    payload = json.loads((ABHI_FIXTURES / fixture_name).read_text(encoding="utf-8"))
+    app.graph.observe_conversation(
+        user_message=payload["user_message"],
+        assistant_response=payload["assistant_response"],
+        project=payload.get("project", ""),
+        session_id=payload.get("session_id", ""),
+        agent_id=payload.get("agent_id", ""),
+    )
+
+
 def write_waggle_codex_config(home: Path, db_path: Path) -> None:
     codex_dir = home / ".codex"
-    codex_dir.mkdir(parents=True)
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    normalized_db_path = db_path.as_posix()
     (codex_dir / "config.toml").write_text(
         "\n".join(
             [
@@ -93,7 +107,7 @@ def write_waggle_codex_config(home: Path, db_path: Path) -> None:
                 'command = "waggle-mcp"',
                 "",
                 "[mcp_servers.waggle.env]",
-                f'WAGGLE_DB_PATH = "{db_path}"',
+                f'WAGGLE_DB_PATH = "{normalized_db_path}"',
                 "",
             ]
         ),
@@ -190,6 +204,7 @@ def test_parser_accepts_graph_editor_commands() -> None:
     clear_project_dry_run_args = parser.parse_args(["clear-project", "--project", "MCP", "--dry-run"])
     clear_all_args = parser.parse_args(["clear-all", "--yes"])
     clear_all_dry_run_args = parser.parse_args(["clear-all", "--dry-run"])
+    doctor_json_args = parser.parse_args(["doctor", "--json"])
     push_args = parser.parse_args(["push", "--client-secret-path", "client.json", "--folder-id", "folder123"])
     pull_args = parser.parse_args(["pull", "file123", "--client-secret-path", "client.json"])
     share_args = parser.parse_args(["share", "file123", "--client-secret-path", "client.json"])
@@ -236,6 +251,8 @@ def test_parser_accepts_graph_editor_commands() -> None:
     assert clear_all_args.command == "clear-all"
     assert clear_all_args.yes is True
     assert clear_all_dry_run_args.dry_run is True
+    assert doctor_json_args.command == "doctor"
+    assert doctor_json_args.json_output is True
     assert push_args.command == "push"
     assert push_args.encrypt is True
     assert push_args.folder_id == "folder123"
@@ -247,9 +264,9 @@ def test_parser_accepts_graph_editor_commands() -> None:
     doctor_json_args = parser.parse_args(["doctor", "--json"])
     doctor_as_json_args = parser.parse_args(["doctor", "--as-json"])
     assert doctor_json_args.command == "doctor"
-    assert doctor_json_args.as_json is True
+    assert doctor_json_args.json_output is True
     assert doctor_as_json_args.command == "doctor"
-    assert doctor_as_json_args.as_json is True
+    assert doctor_as_json_args.json_output is True
 
 
 def test_doctor_flags_mixed_embedding_model_ids(
@@ -260,6 +277,8 @@ def test_doctor_flags_mixed_embedding_model_ids(
     monkeypatch.setattr("waggle.server._KNOWN_CONFIG_PATHS", [("Mock Client", str(mock_config))])
     db_path = tmp_path / "server-memory.db"
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     write_waggle_codex_config(tmp_path, db_path)
     graph = MemoryGraph(db_path, FakeEmbeddingModel())
     graph.observe_conversation(
@@ -315,6 +334,8 @@ def test_doctor_fix_reembeds_mixed_embedding_model_ids(
     monkeypatch.setattr("waggle.server._KNOWN_CONFIG_PATHS", [("Mock Client", str(mock_config))])
     db_path = tmp_path / "server-memory.db"
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     write_waggle_codex_config(tmp_path, db_path)
     graph = MemoryGraph(db_path, FakeEmbeddingModel())
     graph.observe_conversation(
@@ -365,18 +386,74 @@ def test_doctor_fix_reembeds_mixed_embedding_model_ids(
     assert repaired["transcript_stale_rows"] == 0
 
 
-def test_doctor_json_output(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+def test_doctor_json_output_reports_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    mock_config = tmp_path / "mock_config.json"
-    mock_config.write_text(json.dumps({"mcpServers": {"waggle": {}}}))
-    monkeypatch.setattr("waggle.server._KNOWN_CONFIG_PATHS", [("Mock Client", str(mock_config))])
+    home = tmp_path / "home"
+    appdata = home / "AppData" / "Roaming"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("APPDATA", str(appdata))
 
-    db_path = tmp_path / "server-memory.db"
     config = AppConfig(
         backend="sqlite",
         transport="stdio",
-        model_name="fake-model",
+        model_name="deterministic",
+        db_path=str(tmp_path / "server-memory.db"),
+        default_tenant_id="local-default",
+        http_host="127.0.0.1",
+        http_port=8080,
+        log_level="INFO",
+        rate_limit_rpm=120,
+        write_rate_limit_rpm=60,
+        max_concurrent_requests=8,
+        max_payload_bytes=1024 * 1024,
+        request_timeout_seconds=30,
+        export_dir=None,
+        neo4j_uri="",
+        neo4j_username="",
+        neo4j_password="",
+        neo4j_database="",
+    )
+
+    exit_code = _run_doctor(config, json_output=True)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert exit_code == 1
+    assert captured.err == ""
+    assert "\x1b[" not in captured.out
+    assert payload["schema_version"] == 1
+    assert payload["platform"]
+    assert payload["status"] == "issues_found"
+    assert payload["warnings"] == []
+    assert payload["fix_requested"] is False
+    assert any("No MCP client config file" in issue for issue in payload["issues"])
+    assert "Deterministic model — no download needed" in payload["successful_checks"]
+    assert "waggle-mcp doctor" not in captured.out
+
+
+def test_doctor_json_output_ok_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    appdata = home / "AppData" / "Roaming"
+    db_path = tmp_path / "server-memory.db"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("APPDATA", str(appdata))
+    write_waggle_codex_config(home, db_path)
+
+    config = AppConfig(
+        backend="sqlite",
+        transport="stdio",
+        model_name="deterministic",
         db_path=str(db_path),
         default_tenant_id="local-default",
         http_host="127.0.0.1",
@@ -394,20 +471,66 @@ def test_doctor_json_output(
         neo4j_database="",
     )
 
-    exit_code = _run_doctor(config, as_json=True)
-    stdout = capsys.readouterr().out
+
+    exit_code = _run_doctor(config, json_output=True)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
 
     assert exit_code == 0
-    data = json.loads(stdout)
-    assert data["ok"] is True
-    assert isinstance(data["config_files"], list)
-    assert data["database"]["path"] == str(db_path)
-    assert data["database"]["exists"] is False
-    assert data["database"]["parent_exists"] is True
-    assert data["embedding_model"]["model_name"] == "fake-model"
-    assert data["embedding_model"]["deterministic"] is True
-    assert data["startup_mode"] == "normal"
-    assert data["issues"] == []
+    assert captured.err == ""
+    assert "\x1b[" not in captured.out
+    assert payload["schema_version"] == 1
+    assert payload["status"] == "ok"
+    assert payload["issues"] == []
+    assert payload["warnings"] == []
+    assert payload["fix_requested"] is False
+    assert any(item.startswith("Waggle found in:") for item in payload["successful_checks"])
+
+
+def test_doctor_json_output_warning_status_for_uncached_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    appdata = home / "AppData" / "Roaming"
+    db_path = tmp_path / "server-memory.db"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("APPDATA", str(appdata))
+    write_waggle_codex_config(home, db_path)
+
+    config = AppConfig(
+        backend="sqlite",
+        transport="stdio",
+        model_name="sentence-transformers/not-cached-for-waggle-test",
+        db_path=str(db_path),
+        default_tenant_id="local-default",
+        http_host="127.0.0.1",
+        http_port=8080,
+        log_level="INFO",
+        rate_limit_rpm=120,
+        write_rate_limit_rpm=60,
+        max_concurrent_requests=8,
+        max_payload_bytes=1024 * 1024,
+        request_timeout_seconds=30,
+        export_dir=None,
+        neo4j_uri="",
+        neo4j_username="",
+        neo4j_password="",
+        neo4j_database="",
+    )
+
+    exit_code = _run_doctor(config, json_output=True)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert payload["status"] == "warnings"
+    assert payload["issues"] == []
+    assert any("not found in cache" in warning for warning in payload["warnings"])
+
 
 
 def test_create_and_list_api_keys_cli_redacts_hash(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -424,7 +547,7 @@ def test_create_and_list_api_keys_cli_redacts_hash(tmp_path: Path, capsys: pytes
     create_payload = json.loads(capsys.readouterr().out)
 
     assert exit_code == 0
-    assert create_payload["prefix"].startswith("sk_live_")
+    assert create_payload["prefix"].startswith("sk_test_")
     assert create_payload["created_by"] == "ops@example.com"
     assert create_payload["scopes"] == ["graph:read", "graph:write", "admin:read", "admin:write"]
     assert "raw_api_key" in create_payload
@@ -440,6 +563,25 @@ def test_create_and_list_api_keys_cli_redacts_hash(tmp_path: Path, capsys: pytes
     assert listed[0]["expires_at"] is not None
     assert listed[0]["scopes"] == ["graph:read", "graph:write", "admin:read", "admin:write"]
     assert "key_hash" not in listed[0]
+
+
+def test_create_api_key_cli_uses_configured_live_prefix(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    app = make_app(tmp_path)
+    app.config.api_key_environment = "live"
+
+    create_args = SimpleNamespace(
+        command="create-api-key",
+        tenant_id="workspace-a",
+        name="prod-agent",
+        expires_in_days=30,
+        created_by="ops@example.com",
+    )
+    exit_code = _run_admin_command(app.config, create_args)
+    create_payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert create_payload["prefix"].startswith("sk_live_")
+    assert create_payload["raw_api_key"].startswith(create_payload["prefix"])
 
 
 def test_retention_admin_commands_update_and_prune(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -787,12 +929,7 @@ def test_export_validate_inspect_and_import_abhi_tools(tmp_path: Path) -> None:
 
 def test_export_abhi_tool_refuses_likely_secrets_without_force(tmp_path: Path) -> None:
     app = make_app(tmp_path)
-    app.graph.observe_conversation(
-        user_message="My token is sk-abcdefghijklmnopqrstuvwxyz123456.",
-        assistant_response="I will not repeat the token.",
-        session_id="secret-session",
-        project="security",
-    )
+    _seed_transcript_fixture(app, "secret-scan-refusal.json")
 
     refused = app.handle_tool_call(
         "export_abhi",
@@ -807,6 +944,19 @@ def test_export_abhi_tool_refuses_likely_secrets_without_force(tmp_path: Path) -
     assert "appear to contain secrets" in refused.content[0].text
     assert forced.isError is False
     assert Path(forced.structuredContent["output_path"]).exists()
+
+
+def test_export_abhi_tool_allows_false_positive_adjacent_text_without_force(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    _seed_transcript_fixture(app, "secret-scan-safe.json")
+
+    exported = app.handle_tool_call(
+        "export_abhi",
+        {"output_path": str(tmp_path / "safe.abhi"), "project": "security"},
+    )
+
+    assert exported.isError is False
+    assert Path(exported.structuredContent["output_path"]).exists()
 
 
 def test_diff_and_merge_abhi_tools(tmp_path: Path) -> None:
@@ -1522,11 +1672,11 @@ def test_default_graph_uses_sqlite_backend_by_default(tmp_path: Path, monkeypatc
 def test_default_graph_uses_home_scoped_sqlite_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("WAGGLE_BACKEND", raising=False)
     monkeypatch.delenv("WAGGLE_DB_PATH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
-    # Set WAGGLE_DB_PATH directly to avoid Path.home() issues
     expected_db = tmp_path / ".waggle" / "waggle.db"
-    monkeypatch.setenv("WAGGLE_DB_PATH", str(expected_db))
-
     graph = _default_graph()
 
     assert isinstance(graph, MemoryGraph)
@@ -1604,6 +1754,7 @@ def test_write_other_config_no_longer_uses_pythonpath(monkeypatch: pytest.Monkey
 
 def test_write_codex_config_no_longer_uses_pythonpath(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
     config_path = _write_codex(str(tmp_path / "memory.db"), "/tmp/fake-python")
@@ -1632,6 +1783,7 @@ def test_setup_client_arg_normalization() -> None:
 
 def test_write_gemini_config_preserves_existing_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     settings_file = tmp_path / ".gemini" / "settings.json"
     settings_file.parent.mkdir(parents=True)
@@ -1649,6 +1801,7 @@ def test_write_gemini_config_preserves_existing_settings(monkeypatch: pytest.Mon
 
 def test_write_antigravity_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
     config_path = _write_antigravity(str(tmp_path / "memory.db"), "/tmp/fake-python")
@@ -1661,6 +1814,7 @@ def test_write_antigravity_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
 
 def test_run_setup_writes_codex_config_and_agents(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     monkeypatch.chdir(tmp_path)
 
@@ -1687,6 +1841,7 @@ def test_write_codex_config_updates_existing_file_without_duplicates(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     config_file = tmp_path / ".codex" / "config.toml"
     config_file.parent.mkdir(parents=True)

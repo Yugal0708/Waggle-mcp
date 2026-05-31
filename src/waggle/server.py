@@ -496,6 +496,7 @@ def _build_backend(config: AppConfig) -> Any:
             tiered_retrieval_top_k_windows=config.tiered_retrieval_top_k_windows,
             hybrid_retrieval_config=config.hybrid_retrieval_config(),
             export_dir=config.export_dir,
+            api_key_environment=config.api_key_environment,
         )
     from waggle.neo4j_graph import Neo4jMemoryGraph
 
@@ -507,6 +508,7 @@ def _build_backend(config: AppConfig) -> Any:
         embedding_model=embedding_model,
         tenant_id=config.default_tenant_id,
         export_dir=config.export_dir,
+        api_key_environment=config.api_key_environment,
     )
 
 
@@ -3495,6 +3497,13 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
     async def graph_create_edge(request: Request) -> Response:
         payload = await request.json()
         graph, _ = _require_http_scope(request, "graph:write")
+        raw_weight = payload.get("weight", 1.0)
+        try:
+            weight_value = float(raw_weight)
+        except (TypeError, ValueError):
+            raise ValidationFailure("Edge weight must be a numeric value between 0 and 1.")
+        if not (0 <= weight_value <= 1):
+            raise ValidationFailure("Edge weight must be a numeric value between 0 and 1.")
         snapshot = graph.get_graph_snapshot()
         snapshot["edges"] = [*snapshot.get("edges", []), _edge_snapshot_payload(snapshot=snapshot, payload=payload)]
         _validate_live_snapshot(snapshot)
@@ -3511,6 +3520,13 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         edge_id = request.path_params["edge_id"]
         payload = await request.json()
         graph, _ = _require_http_scope(request, "graph:write")
+        if "weight" in payload and payload.get("weight") is not None:
+            try:
+                weight_value = float(payload["weight"])
+            except (TypeError, ValueError):
+                raise ValidationFailure("Edge weight must be a numeric value between 0 and 1.")
+            if not (0 <= weight_value <= 1):
+                raise ValidationFailure("Edge weight must be a numeric value between 0 and 1.")
         snapshot = graph.get_graph_snapshot()
         existing = next(
             (item for item in snapshot.get("edges", []) if str(item.get("id", "")).strip() == edge_id), None
@@ -3524,6 +3540,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
             for item in snapshot.get("edges", [])
         ]
         _validate_live_snapshot(snapshot)
+
         edge = graph.update_edge(
             edge_id=edge_id,
             source_id=str(payload.get("source_id", "")).strip() or None,
@@ -4515,9 +4532,9 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor.add_argument(
         "--json",
         "--as-json",
-        dest="as_json",
+        dest="json_output",
         action="store_true",
-        help="Output doctor results in structured JSON format.",
+        help="Print a machine-readable JSON report instead of the human-readable doctor output.",
     )
 
     demo_cmd = subparsers.add_parser(
@@ -4996,7 +5013,7 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
         print(_FEATURES_GUIDE)
         return 0
     if args.command == "doctor":
-        return _run_doctor(config, fix=bool(getattr(args, "fix", False)), as_json=bool(getattr(args, "as_json", False)))
+        return _run_doctor(config, fix=bool(getattr(args, "fix", False)), json_output=bool(getattr(args, "json_output", False)))
     raise ValidationFailure(f"Unknown command: {args.command}")
 
 
@@ -5036,19 +5053,18 @@ Known API gotchas (from the Waggle field error log):
 """
 
 
-def _run_doctor(config: AppConfig, *, fix: bool = False, as_json: bool = False) -> int:
+def _run_doctor(config: AppConfig, *, fix: bool = False, json_output: bool = False) -> int:
     """waggle-mcp doctor — surface configuration and environment issues."""
     issues: list[str] = []
+    warnings: list[str] = []
     ok_items: list[str] = []
 
-    if not as_json:
-        print()
-        print(_c(_BOLD, "waggle-mcp doctor"))
-        print(_c(_CYAN, "─" * 50))
+    print()
+    print(_c(_BOLD, "waggle-mcp doctor"))
+    print(_c(_CYAN, "─" * 50))
 
     # ── 1. Config file locations ─────────────────────────────────────────────
-    if not as_json:
-        print(_c(_BOLD, "\n[1] MCP client config files"))
+    print(_c(_BOLD, "\n[1] MCP client config files"))
     waggle_found_in: list[str] = []
     config_files_data = []
     for label, template in _KNOWN_CONFIG_PATHS:
@@ -5069,14 +5085,11 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, as_json: bool = False) 
                 parsed = True
                 if has_waggle:
                     waggle_found_in.append(label)
-                    if not as_json:
-                        _ok(f"{label}\n     {path}  [waggle entry found]")
+                    _ok(f"{label}\n     {path}  [waggle entry found]")
                 else:
-                    if not as_json:
-                        print(f"  {_c(_CYAN, chr(0x2022))} {label}\n     {path}  [exists, no waggle entry]")
+                    print(f"  {_c(_CYAN, chr(0x2022))} {label}\n     {path}  [exists, no waggle entry]")
             except Exception:
-                if not as_json:
-                    print(f"  {_c(_CYAN, chr(0x2022))} {label}\n     {path}  [exists, could not parse]")
+                print(f"  {_c(_CYAN, chr(0x2022))} {label}\n     {path}  [exists, could not parse]")
         # only show missing paths that are plausible for this platform
         elif (
             (
@@ -5086,8 +5099,7 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, as_json: bool = False) 
             or (sys.platform == "win32" and "Windows" in label)
             or (sys.platform.startswith("linux") and ("Linux" in label or "Cursor" in label))
         ):
-            if not as_json:
-                print(f"  {_c(_CYAN, chr(0x2022))} {label}\n     {path}  [not found]")
+            print(f"  {_c(_CYAN, chr(0x2022))} {label}\n     {path}  [not found]")
 
         is_plausible = (
             exists
@@ -5112,29 +5124,26 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, as_json: bool = False) 
         ok_items.append(f"Waggle found in: {', '.join(waggle_found_in)}")
 
     # ── 2. DB path ───────────────────────────────────────────────────────────
-    if not as_json:
-        print(_c(_BOLD, "\n[2] Database path"))
+    print(_c(_BOLD, "\n[2] Database path"))
     db_path = Path(config.db_path)
     db_dir = db_path.parent
     db_exists = db_path.exists()
     db_dir_exists = db_dir.exists()
     if db_exists:
-        if not as_json:
-            _ok(f"DB file exists: {db_path}")
+        _ok(f"DB file exists: {db_path}")
         ok_items.append("DB file found")
     elif db_dir_exists:
-        if not as_json:
-            _ok(f"DB directory exists (file will be created on first run): {db_path}")
+        _ok(f"DB directory exists (file will be created on first run): {db_path}")
         ok_items.append("DB directory writable")
     else:
         issues.append(f"DB directory does not exist: {db_dir}. Create it with: mkdir -p <dir>")
-        if not as_json:
-            _fail(f"DB directory missing: {db_dir}")
+        _fail(f"DB directory missing: {db_dir}")
 
     # ── 3. Embedding model ───────────────────────────────────────────────────
-    if not as_json:
-        print(_c(_BOLD, "\n[3] Embedding model"))
+    print(_c(_BOLD, "\n[3] Embedding model"))
     model_name = config.model_name
+    is_deterministic = model_name.strip().lower() in {"fake", "fake-model", "deterministic", "offline-demo"}
+    is_cached = False
     hf_home = (
         os.environ.get("HF_HOME")
         or os.environ.get("SENTENCE_TRANSFORMERS_HOME")
@@ -5142,11 +5151,8 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, as_json: bool = False) 
     )
     st_cache = Path(os.environ.get("SENTENCE_TRANSFORMERS_HOME", Path(hf_home) / "hub"))
 
-    is_deterministic = model_name.strip().lower() in {"fake", "fake-model", "deterministic", "offline-demo"}
-    is_cached = False
     if is_deterministic:
-        if not as_json:
-            _ok(f"Model: {model_name!r}  (deterministic — no download, always offline-safe)")
+        _ok(f"Model: {model_name!r}  (deterministic — no download, always offline-safe)")
         ok_items.append("Deterministic model — no download needed")
     else:
         # Heuristic: look for a cached sentence-transformers directory
@@ -5158,17 +5164,15 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, as_json: bool = False) 
         ]
         is_cached = any(p.exists() for p in possible_dirs)
         if is_cached:
-            if not as_json:
-                _ok(f"Model: {model_name!r}  (cached locally — fast startup)")
+            _ok(f"Model: {model_name!r}  (cached locally — fast startup)")
             ok_items.append("Embedding model cached")
         else:
-            if not as_json:
-                print(
-                    f"  {_c(_CYAN, chr(0x2139))} Model: {model_name!r}  — NOT found in local cache.\n"
-                    f"    First store_node/query_graph call will download ~420 MB from HuggingFace.\n"
-                    f"    To avoid: set WAGGLE_MODEL=deterministic, or pre-download with:\n"
-                    f"      python -c \"from sentence_transformers import SentenceTransformer; SentenceTransformer('{model_name}')\""
-                )
+            print(
+                f"  {_c(_CYAN, chr(0x2139))} Model: {model_name!r}  — NOT found in local cache.\n"
+                f"    First store_node/query_graph call will download ~420 MB from HuggingFace.\n"
+                f"    To avoid: set WAGGLE_MODEL=deterministic, or pre-download with:\n"
+                f"      python -c \"from sentence_transformers import SentenceTransformer; SentenceTransformer('{model_name}')\""
+            )
             issues.append(
                 f"Embedding model '{model_name}' not found in cache. "
                 "First semantic call will block for a network download. "
@@ -5178,35 +5182,30 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, as_json: bool = False) 
     embedding_model_data = {"model_name": model_name, "cached": is_cached, "deterministic": is_deterministic}
 
     # ── 4. WAGGLE_STARTUP_MODE ───────────────────────────────────────────────
-    if not as_json:
-        print(_c(_BOLD, "\n[4] Embedding store"))
-    graph = _default_graph(config)
+    print(_c(_BOLD, "\n[4] Embedding store"))
     embedding_store_data = None
+    graph = _default_graph(config)
     if isinstance(graph, MemoryGraph):
         store_health = graph.get_embedding_store_health()
         if fix and (store_health["transcript_stale_rows"] or store_health["node_stale_rows"]):
             repair = graph.reembed_stale_embeddings(batch_size=100)
-            if not as_json:
-                _ok(
-                    "Re-embedded stale rows: "
-                    f"{repair['transcript_rows_updated']} transcript rows, {repair['node_rows_updated']} node rows."
-                )
+            _ok(
+                "Re-embedded stale rows: "
+                f"{repair['transcript_rows_updated']} transcript rows, {repair['node_rows_updated']} node rows."
+            )
             store_health = graph.get_embedding_store_health()
         transcript_models = store_health["transcript_model_counts"]
         node_models = store_health["node_model_counts"]
-        if not as_json:
-            print(f"  Current model id: {store_health['current_model_id']}")
-            print(f"  Transcript model ids: {transcript_models or '{}'}")
-            print(f"  Node model ids: {node_models or '{}'}")
-            print(f"  Stale transcript rows: {store_health['transcript_stale_rows']}")
-            print(f"  Stale node rows: {store_health['node_stale_rows']}")
+        print(f"  Current model id: {store_health['current_model_id']}")
+        print(f"  Transcript model ids: {transcript_models or '{}'}")
+        print(f"  Node model ids: {node_models or '{}'}")
+        print(f"  Stale transcript rows: {store_health['transcript_stale_rows']}")
+        print(f"  Stale node rows: {store_health['node_stale_rows']}")
         if store_health["mixed_models"]:
             issues.append("Mixed embedding_model_id values detected in the store.")
-            if not as_json:
-                _fail("Mixed embedding model IDs detected across transcript_records/nodes.")
+            _fail("Mixed embedding model IDs detected across transcript_records/nodes.")
         else:
-            if not as_json:
-                _ok("Store model IDs are consistent.")
+            _ok("Store model IDs are consistent.")
 
         embedding_store_data = {
             "current_model_id": store_health["current_model_id"],
@@ -5218,69 +5217,53 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, as_json: bool = False) 
         }
 
     # ── 5. WAGGLE_STARTUP_MODE ───────────────────────────────────────────────
-    if not as_json:
-        print(_c(_BOLD, "\n[5] Startup mode"))
-        print(f"  WAGGLE_STARTUP_MODE = {config.startup_mode!r}")
+    print(_c(_BOLD, "\n[5] Startup mode"))
+    print(f"  WAGGLE_STARTUP_MODE = {config.startup_mode!r}")
     if config.is_fast_mode:
-        if not as_json:
-            _ok("fast mode: zero ML overhead. Schema/tool listing only. Semantic tools return 'unavailable'.")
+        _ok("fast mode: zero ML overhead. Schema/tool listing only. Semantic tools return 'unavailable'.")
     elif config.is_strict_mode:
-        if not as_json:
-            _ok("strict mode: server blocks on startup until embedding model is ready.")
+        _ok("strict mode: server blocks on startup until embedding model is ready.")
     else:
-        if not as_json:
-            _ok("normal mode: embedding loads in background. First semantic call may wait up to ~30 s.")
+        _ok("normal mode: embedding loads in background. First semantic call may wait up to ~30 s.")
 
     # ── 6. Windows stdout encoding ───────────────────────────────────────────
     stdout_encoding_data = None
     if sys.platform == "win32":
-        if not as_json:
-            print(_c(_BOLD, "\n[6] Windows stdout encoding"))
+        print(_c(_BOLD, "\n[6] Windows stdout encoding"))
         enc = getattr(sys.stdout, "encoding", "unknown")
         is_utf8 = enc.lower().replace("-", "") in ("utf8", "utf8")
         if is_utf8:
-            if not as_json:
-                _ok(f"stdout encoding: {enc}")
+            _ok(f"stdout encoding: {enc}")
         else:
-            if not as_json:
-                _fail(
-                    f"stdout encoding is {enc!r} (not UTF-8). "
-                    "Unicode characters (emoji, accented text) will cause UnicodeEncodeError.\n"
-                    "    Fix: run with 'python -X utf8' or add at script top:\n"
-                    "      import sys; sys.stdout.reconfigure(encoding='utf-8')"
-                )
+            _fail(
+                f"stdout encoding is {enc!r} (not UTF-8). "
+                "Unicode characters (emoji, accented text) will cause UnicodeEncodeError.\n"
+                "    Fix: run with 'python -X utf8' or add at script top:\n"
+                "      import sys; sys.stdout.reconfigure(encoding='utf-8')"
+            )
             issues.append(f"Windows stdout encoding is {enc!r} — set PYTHONUTF8=1 or use python -X utf8.")
         stdout_encoding_data = {"encoding": enc, "is_utf8": is_utf8}
 
     # ── 7. Known gotchas ─────────────────────────────────────────────────────
-    if not as_json:
-        print(_c(_BOLD, "\n[7] Known API gotchas"))
-        print(_DOCTOR_KNOWN_GOTCHAS)
+    print(_c(_BOLD, "\n[7] Known API gotchas"))
+    print(_DOCTOR_KNOWN_GOTCHAS)
 
     # ── Summary ──────────────────────────────────────────────────────────────
-    if not as_json:
-        print(_c(_BOLD, "─" * 50))
+    print(_c(_BOLD, "─" * 50))
     if issues:
-        if not as_json:
-            print(_c(_RED, f"Found {len(issues)} issue(s):"))
-            for i, issue in enumerate(issues, 1):
-                print(f"  {i}. {issue}")
-            print()
-        else:
-            result = {
-                "ok": False,
-                "config_files": config_files_data,
-                "database": {"path": str(db_path), "exists": db_exists, "parent_exists": db_dir_exists},
-                "embedding_model": embedding_model_data,
-                "embedding_store": embedding_store_data,
-                "startup_mode": config.startup_mode,
-                "stdout_encoding": stdout_encoding_data,
-                "issues": issues,
-            }
-            print(json.dumps(result, indent=2))
+        print(_c(_RED, f"Found {len(issues)} issue(s):"))
+        for i, issue in enumerate(issues, 1):
+            print(f"  {i}. {issue}")
+        print()
         return 1
+    if warnings:
+        print(_c(_CYAN, f"Warnings ({len(warnings)}):"))
+        for i, warning in enumerate(warnings, 1):
+            print(f"  {i}. {warning}")
+        print()
+        return 0
     else:
-        if not as_json:
+        if not json_output:
             print(_c(_GREEN, f"All checks passed ({len(ok_items)} OK). Waggle looks healthy."))
             print()
         else:
@@ -6230,9 +6213,7 @@ def main() -> None:
     if command == "doctor":
         # Doctor only needs the config — not a live backend connection.
         config = AppConfig.from_env()
-        sys.exit(
-            _run_doctor(config, fix=bool(getattr(args, "fix", False)), as_json=bool(getattr(args, "as_json", False)))
-        )
+        sys.exit(_run_doctor(config, fix=bool(getattr(args, "fix", False)), json_output=bool(getattr(args, "json_output", False))))
 
     config = AppConfig.from_env()
     if command == "serve" and getattr(args, "transport", None):

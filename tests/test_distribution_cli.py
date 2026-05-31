@@ -60,6 +60,8 @@ def test_json_client_writers_use_packaged_stdio_command(
     writer,
     relative_path: str,
 ) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     monkeypatch.setattr("waggle.server.sys.platform", "linux")
 
