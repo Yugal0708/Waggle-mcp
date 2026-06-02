@@ -150,15 +150,6 @@ class ExpansionMeta:
     effective_priority: float
 
 
-@dataclass(frozen=True)
-class ScoredNodeView:
-    """Lightweight sort key for candidate nodes — avoids repeated attribute lookups in Timsort."""
-    node_id: str
-    updated_at_ts: float
-    access_count: int
-    final_score: float
-    label_lower: str
-
 class _NeutralTemporalHints:
     """Neutral temporal hints for operations without query-driven time intent."""
 
@@ -502,6 +493,8 @@ CREATE INDEX IF NOT EXISTS idx_transcripts_tenant_observed ON transcript_records
 CREATE INDEX IF NOT EXISTS idx_transcripts_tenant_session_turn ON transcript_records(tenant_id, session_id, turn_index);
 CREATE INDEX IF NOT EXISTS idx_transcripts_tenant_content_hash ON transcript_records(tenant_id, content_hash);
 CREATE INDEX IF NOT EXISTS idx_transcripts_tenant_turn_pair ON transcript_records(tenant_id, turn_pair_id);
+CREATE INDEX IF NOT EXISTS idx_transcripts_tenant_project ON transcript_records(tenant_id, project);
+CREATE INDEX IF NOT EXISTS idx_transcripts_tenant_agent ON transcript_records(tenant_id, agent_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_source_turn_pair ON nodes(tenant_id, source_turn_pair_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
@@ -697,6 +690,19 @@ def _normalized_content_hash(text: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# _ReadWriteLock — pure-Python reader/writer lock (no extra dependencies)
+# ---------------------------------------------------------------------------
+# Allows concurrent reads while serialising writes.  Replaces the single
+# threading.RLock that previously serialised ALL access — including reads that
+# could safely run in parallel.
+#
+# Usage (mirrors threading.RLock context manager contract):
+#   with graph._lock:          # write — exclusive
+#       ...
+#   with graph._read_lock():   # read  — shared (multiple allowed)
+#       ...
+# ---------------------------------------------------------------------------
 class _ReadWriteLock:
     def __init__(self) -> None:
         self._cond = threading.Condition(threading.Lock())
@@ -706,9 +712,6 @@ class _ReadWriteLock:
         self._write_depth: int = 0
         self._reader_threads: dict[int, int] = {}
 
-    # ------------------------------------------------------------------
-    # Write lock — exclusive, re-entrant for the owning thread
-    # ------------------------------------------------------------------
     def __enter__(self) -> "_ReadWriteLock":
         self._acquire_write()
         return self
@@ -747,9 +750,6 @@ class _ReadWriteLock:
                 self._write_owner = None
                 self._cond.notify_all()
 
-    # ------------------------------------------------------------------
-    # Read lock — shared, blocks only when a *different* thread is writing
-    # ------------------------------------------------------------------
     def read(self) -> "contextmanager":
         return self._read_context()
 
@@ -784,7 +784,6 @@ class _ReadWriteLock:
             self._readers -= 1
             if self._readers == 0:
                 self._cond.notify_all()
-
 class MemoryGraph:
     """SQLite-backed graph memory with embedding-assisted retrieval."""
 
@@ -1795,7 +1794,13 @@ class MemoryGraph:
             vec_a = self.embedding_model.from_bytes(emb_a)
             vec_b = self.embedding_model.from_bytes(emb_b)
             return self.embedding_model.cosine_similarity(vec_a, vec_b)
-        except Exception:
+        except Exception as exc:
+            LOGGER.warning(
+                "Failed to compute cosine similarity between nodes %s and %s: %s",
+                a.id,
+                b.id,
+                exc,
+            )
             return None
 
     def _backfill_transcript_storage(self, connection: sqlite3.Connection, *, batch_size: int = 100) -> None:
@@ -3761,14 +3766,19 @@ class MemoryGraph:
             elif agent_id.strip():
                 filters.append("agent_id = ?")
                 params.append(agent_id.strip())
+            # Cap the rows fetched so we don't scan and score the entire tenant.
+            # The downstream scorer uses up to max_hits results; read a generous
+            # multiple so semantic ranking still has a good pool to draw from.
+            fetch_limit = min(max(500, max_hits * 4), 5000)
             rows = connection.execute(
                 f"""
                 SELECT id, tenant_id, agent_id, project, session_id, observed_at, turn_index, role, transcript_text, embedding, metadata
                 FROM transcript_records
                 WHERE {" AND ".join(filters)}
                 ORDER BY observed_at DESC, turn_index DESC
+                LIMIT ?
                 """,
-                tuple(params),
+                (*params, fetch_limit),
             ).fetchall()
         if not rows:
             return []
@@ -3843,14 +3853,16 @@ class MemoryGraph:
             elif agent_id.strip():
                 filters.append("agent_id = ?")
                 params.append(agent_id.strip())
+            fetch_limit = 5000
             rows = connection.execute(
                 f"""
                 SELECT id, tenant_id, agent_id, project, session_id, observed_at, turn_index, role, transcript_text, embedding, metadata
                 FROM transcript_records
                 WHERE {" AND ".join(filters)}
                 ORDER BY observed_at DESC, turn_index DESC
+                LIMIT ?
                 """,
-                tuple(params),
+                (*params, fetch_limit),
             ).fetchall()
         if not rows:
             return {}
@@ -4262,49 +4274,52 @@ class MemoryGraph:
             )
             return node
 
-    def clear_session(self, *, session_id: str) -> ClearScopeResult:
+    def clear_session(self, *, session_id: str, dry_run: bool = False) -> ClearScopeResult:
         normalized_session = session_id.strip()
         if not normalized_session:
             raise ValueError("session_id is required.")
         with self._lock, self._connect() as connection:
-            result = self._clear_scope_rows(connection, scope="session", session_id=normalized_session)
-            self.emit_audit_event(
-                event_type="graph.scope_cleared",
-                resource_type="session",
-                resource_id=normalized_session,
-                action="delete",
-                metadata=result.model_dump(mode="json"),
-                connection=connection,
-            )
+            result = self._clear_scope_rows(connection, scope="session", session_id=normalized_session, dry_run=dry_run)
+            if not dry_run:
+                self.emit_audit_event(
+                    event_type="graph.scope_cleared",
+                    resource_type="session",
+                    resource_id=normalized_session,
+                    action="delete",
+                    metadata=result.model_dump(mode="json"),
+                    connection=connection,
+                )
             return result
 
-    def clear_project(self, *, project: str) -> ClearScopeResult:
+    def clear_project(self, *, project: str, dry_run: bool = False) -> ClearScopeResult:
         normalized_project = project.strip()
         if not normalized_project:
             raise ValueError("project is required.")
         with self._lock, self._connect() as connection:
-            result = self._clear_scope_rows(connection, scope="project", project=normalized_project)
-            self.emit_audit_event(
-                event_type="graph.scope_cleared",
-                resource_type="project",
-                resource_id=normalized_project,
-                action="delete",
-                metadata=result.model_dump(mode="json"),
-                connection=connection,
-            )
+            result = self._clear_scope_rows(connection, scope="project", project=normalized_project, dry_run=dry_run)
+            if not dry_run:
+                self.emit_audit_event(
+                    event_type="graph.scope_cleared",
+                    resource_type="project",
+                    resource_id=normalized_project,
+                    action="delete",
+                    metadata=result.model_dump(mode="json"),
+                    connection=connection,
+                )
             return result
 
-    def clear_all(self) -> ClearScopeResult:
+    def clear_all(self, *, dry_run: bool = False) -> ClearScopeResult:
         with self._lock, self._connect() as connection:
-            result = self._clear_scope_rows(connection, scope="all")
-            self.emit_audit_event(
-                event_type="graph.scope_cleared",
-                resource_type="tenant",
-                resource_id=self.tenant_id,
-                action="delete",
-                metadata=result.model_dump(mode="json"),
-                connection=connection,
-            )
+            result = self._clear_scope_rows(connection, scope="all", dry_run=dry_run)
+            if not dry_run:
+                self.emit_audit_event(
+                    event_type="graph.scope_cleared",
+                    resource_type="tenant",
+                    resource_id=self.tenant_id,
+                    action="delete",
+                    metadata=result.model_dump(mode="json"),
+                    connection=connection,
+                )
             return result
 
     def _clear_scope_rows(
@@ -4314,16 +4329,15 @@ class MemoryGraph:
         scope: str,
         project: str = "",
         session_id: str = "",
+        dry_run: bool = False,
     ) -> ClearScopeResult:
-        result = ClearScopeResult(scope=scope, project=project, session_id=session_id)
+        result = ClearScopeResult(scope=scope, project=project, session_id=session_id, dry_run=dry_run)
         if scope == "all":
-            node_ids = [
-                str(row["id"])
-                for row in connection.execute(
-                    "SELECT id FROM nodes WHERE tenant_id = ?",
-                    (self.tenant_id,),
-                ).fetchall()
-            ]
+            node_rows = connection.execute(
+                "SELECT id, node_type FROM nodes WHERE tenant_id = ?",
+                (self.tenant_id,),
+            ).fetchall()
+            node_ids = [str(row["id"]) for row in node_rows]
             window_ids = [
                 str(row["id"])
                 for row in connection.execute(
@@ -4339,13 +4353,23 @@ class MemoryGraph:
                 ).fetchall()
             ]
             result.deleted_graph_ui_rows = connection.execute(
-                "DELETE FROM graph_ui_state WHERE tenant_id = ?",
+                "SELECT COUNT(*) FROM graph_ui_state WHERE tenant_id = ?",
                 (self.tenant_id,),
-            ).rowcount
+            ).fetchone()[0]
             result.deleted_transcripts = connection.execute(
-                "DELETE FROM transcript_records WHERE tenant_id = ?",
+                "SELECT COUNT(*) FROM transcript_records WHERE tenant_id = ?",
                 (self.tenant_id,),
-            ).rowcount
+            ).fetchone()[0]
+
+            if not dry_run:
+                connection.execute(
+                    "DELETE FROM graph_ui_state WHERE tenant_id = ?",
+                    (self.tenant_id,),
+                )
+                connection.execute(
+                    "DELETE FROM transcript_records WHERE tenant_id = ?",
+                    (self.tenant_id,),
+                )
         elif scope == "project":
             repo_ids = [
                 str(row["id"])
@@ -4366,21 +4390,29 @@ class MemoryGraph:
                     (self.tenant_id, project),
                 ).fetchall()
             ]
-            node_ids = [
-                str(row["id"])
-                for row in connection.execute(
-                    "SELECT id FROM nodes WHERE tenant_id = ? AND project = ?",
-                    (self.tenant_id, project),
-                ).fetchall()
-            ]
+            node_rows = connection.execute(
+                "SELECT id, node_type FROM nodes WHERE tenant_id = ? AND project = ?",
+                (self.tenant_id, project),
+            ).fetchall()
+            node_ids = [str(row["id"]) for row in node_rows]
             result.deleted_graph_ui_rows = connection.execute(
-                "DELETE FROM graph_ui_state WHERE tenant_id = ? AND project = ?",
+                "SELECT COUNT(*) FROM graph_ui_state WHERE tenant_id = ? AND project = ?",
                 (self.tenant_id, project),
-            ).rowcount
+            ).fetchone()[0]
             result.deleted_transcripts = connection.execute(
-                "DELETE FROM transcript_records WHERE tenant_id = ? AND project = ?",
+                "SELECT COUNT(*) FROM transcript_records WHERE tenant_id = ? AND project = ?",
                 (self.tenant_id, project),
-            ).rowcount
+            ).fetchone()[0]
+
+            if not dry_run:
+                connection.execute(
+                    "DELETE FROM graph_ui_state WHERE tenant_id = ? AND project = ?",
+                    (self.tenant_id, project),
+                )
+                connection.execute(
+                    "DELETE FROM transcript_records WHERE tenant_id = ? AND project = ?",
+                    (self.tenant_id, project),
+                )
         elif scope == "session":
             repo_ids = []
             window_ids = [
@@ -4390,58 +4422,102 @@ class MemoryGraph:
                     (self.tenant_id, session_id),
                 ).fetchall()
             ]
-            node_ids = [
-                str(row["id"])
-                for row in connection.execute(
-                    "SELECT id FROM nodes WHERE tenant_id = ? AND session_id = ?",
-                    (self.tenant_id, session_id),
-                ).fetchall()
-            ]
+            node_rows = connection.execute(
+                "SELECT id, node_type FROM nodes WHERE tenant_id = ? AND session_id = ?",
+                (self.tenant_id, session_id),
+            ).fetchall()
+            node_ids = [str(row["id"]) for row in node_rows]
             result.deleted_graph_ui_rows = connection.execute(
-                "DELETE FROM graph_ui_state WHERE tenant_id = ? AND session_id = ?",
+                "SELECT COUNT(*) FROM graph_ui_state WHERE tenant_id = ? AND session_id = ?",
                 (self.tenant_id, session_id),
-            ).rowcount
+            ).fetchone()[0]
             result.deleted_transcripts = connection.execute(
-                "DELETE FROM transcript_records WHERE tenant_id = ? AND session_id = ?",
+                "SELECT COUNT(*) FROM transcript_records WHERE tenant_id = ? AND session_id = ?",
                 (self.tenant_id, session_id),
-            ).rowcount
+            ).fetchone()[0]
+
+            if not dry_run:
+                connection.execute(
+                    "DELETE FROM graph_ui_state WHERE tenant_id = ? AND session_id = ?",
+                    (self.tenant_id, session_id),
+                )
+                connection.execute(
+                    "DELETE FROM transcript_records WHERE tenant_id = ? AND session_id = ?",
+                    (self.tenant_id, session_id),
+                )
         else:
             raise ValueError(f"Unsupported clear scope: {scope}")
+
+        # Compute counts by node type
+        counts_by_node_type: dict[str, int] = {}
+        for row in node_rows:
+            nt = str(row["node_type"])
+            counts_by_node_type[nt] = counts_by_node_type.get(nt, 0) + 1
+        result.counts_by_node_type = counts_by_node_type
 
         if node_ids:
             placeholders = ", ".join("?" for _ in node_ids)
             result.deleted_edges = connection.execute(
                 f"""
-                DELETE FROM edges
+                SELECT COUNT(*) FROM edges
                 WHERE tenant_id = ? AND (source_id IN ({placeholders}) OR target_id IN ({placeholders}))
                 """,
                 (self.tenant_id, *node_ids, *node_ids),
-            ).rowcount
-            result.deleted_nodes = connection.execute(
-                f"DELETE FROM nodes WHERE tenant_id = ? AND id IN ({placeholders})",
-                (self.tenant_id, *node_ids),
-            ).rowcount
+            ).fetchone()[0]
+            result.deleted_nodes = len(node_ids)
+
+            if not dry_run:
+                connection.execute(
+                    f"""
+                    DELETE FROM edges
+                    WHERE tenant_id = ? AND (source_id IN ({placeholders}) OR target_id IN ({placeholders}))
+                    """,
+                    (self.tenant_id, *node_ids, *node_ids),
+                )
+                connection.execute(
+                    f"DELETE FROM nodes WHERE tenant_id = ? AND id IN ({placeholders})",
+                    (self.tenant_id, *node_ids),
+                )
 
         if window_ids:
             placeholders = ", ".join("?" for _ in window_ids)
             result.deleted_context_window_edges = connection.execute(
                 f"""
-                DELETE FROM context_window_edges
+                SELECT COUNT(*) FROM context_window_edges
                 WHERE tenant_id = ? AND (source_window_id IN ({placeholders}) OR target_window_id IN ({placeholders}))
                 """,
                 (self.tenant_id, *window_ids, *window_ids),
-            ).rowcount
+            ).fetchone()[0]
             result.deleted_context_windows = connection.execute(
-                f"DELETE FROM context_windows WHERE tenant_id = ? AND id IN ({placeholders})",
+                f"SELECT COUNT(*) FROM context_windows WHERE tenant_id = ? AND id IN ({placeholders})",
                 (self.tenant_id, *window_ids),
-            ).rowcount
+            ).fetchone()[0]
+
+            if not dry_run:
+                connection.execute(
+                    f"""
+                    DELETE FROM context_window_edges
+                    WHERE tenant_id = ? AND (source_window_id IN ({placeholders}) OR target_window_id IN ({placeholders}))
+                    """,
+                    (self.tenant_id, *window_ids, *window_ids),
+                )
+                connection.execute(
+                    f"DELETE FROM context_windows WHERE tenant_id = ? AND id IN ({placeholders})",
+                    (self.tenant_id, *window_ids),
+                )
 
         if repo_ids:
             placeholders = ", ".join("?" for _ in repo_ids)
             result.deleted_repos = connection.execute(
-                f"DELETE FROM repos WHERE tenant_id = ? AND id IN ({placeholders})",
+                f"SELECT COUNT(*) FROM repos WHERE tenant_id = ? AND id IN ({placeholders})",
                 (self.tenant_id, *repo_ids),
-            ).rowcount
+            ).fetchone()[0]
+
+            if not dry_run:
+                connection.execute(
+                    f"DELETE FROM repos WHERE tenant_id = ? AND id IN ({placeholders})",
+                    (self.tenant_id, *repo_ids),
+                )
         elif scope == "all":
             result.deleted_repos = len(repo_ids)
 
@@ -6633,9 +6709,11 @@ class MemoryGraph:
         best_match: tuple[Node, float] | None = None
 
         # Pre-normalise the query embedding ONCE so the inner loop only needs a
-        # single np.dot() per candidate instead of two norm computations.
+        # single np.dot() per candidate instead of two norm computations. Use a
+        # fresh local so we don't shadow the `embedding` parameter — keeps the
+        # invariant "normalisation happens here, not silently for callers" clear.
         _emb_norm = float(np.linalg.norm(embedding))
-        embedding = embedding / _emb_norm if _emb_norm > 0.0 else embedding
+        query_unit = embedding / _emb_norm if _emb_norm > 0.0 else embedding
 
         for row in rows:
             existing_node = self._row_to_node(row)
@@ -6688,9 +6766,8 @@ class MemoryGraph:
 
             # ── Layer 3: semantic similarity (expensive — compute embedding once) ─
             existing_embedding = self.embedding_model.from_bytes(row["embedding"])
-            # Use fast dot() — caller pre-normalises `embedding` before the loop
-            # so np.dot(normed_a, normed_b) == cosine_similarity(a, b).
-            similarity = float(np.dot(embedding, existing_embedding / (np.linalg.norm(existing_embedding) or 1.0)))
+            # Fast dot() — both vectors are unit-norm here, so this equals cosine.
+            similarity = float(np.dot(query_unit, existing_embedding / (np.linalg.norm(existing_embedding) or 1.0)))
             label_score = label_similarity(node.label, existing_node.label)
             acronym_match = is_acronym_match(node.label, existing_node.label)
 
@@ -7982,23 +8059,25 @@ class MemoryGraph:
                     node.label.lower(),
                 ),
             )
-        # Build lightweight ScoredNodeView keys once per node, then sort by those.
-        # This avoids calling .timestamp() and .lower() inside the comparator on
-        # every pair comparison (Python's sort is Timsort — O(N log N) comparisons).
-        scored_views = [
-            ScoredNodeView(
-                node_id=node.id,
-                updated_at_ts=node.updated_at.timestamp(),
-                access_count=node.access_count,
-                final_score=combined_score(node),
-                label_lower=node.label.lower(),
+        # Pair each Node with a lightweight ScoredNodeView built once. Sorting on
+        # the pre-computed slot fields avoids calling .timestamp() and .lower()
+        # inside the comparator on every pair comparison (Timsort is O(N log N)).
+        # Pairing keeps the Node→view association 1:1 so we don't need a dict
+        # round-trip or duplicate-id safety nets in the result construction.
+        view_node_pairs: list[tuple[ScoredNodeView, Node]] = [
+            (
+                ScoredNodeView(
+                    node_id=node.id,
+                    updated_at_ts=node.updated_at.timestamp(),
+                    final_score=combined_score(node),
+                    label_lower=node.label.lower(),
+                ),
+                node,
             )
             for node in candidate_nodes
         ]
-        scored_views.sort(key=lambda v: (-v.final_score, -v.updated_at_ts, v.label_lower))
-        # Rebuild the original Node order from the sorted view.
-        order = {v.node_id: i for i, v in enumerate(scored_views)}
-        return sorted(candidate_nodes, key=lambda n: order.get(n.id, len(scored_views)))
+        view_node_pairs.sort(key=lambda pair: (-pair[0].final_score, -pair[0].updated_at_ts, pair[0].label_lower))
+        return [node for _, node in view_node_pairs]
 
     def _add_clause_seed_ids(
         self,
@@ -8343,13 +8422,14 @@ class MemoryGraph:
         if not node_ids:
             return []
         placeholders = ", ".join("?" for _ in node_ids)
+        # Use OR so the graph walk can traverse outward: return any edge
+        # whose source OR target is in the current seed set.
         rows = connection.execute(
             f"""
             SELECT id, source_id, target_id, relationship, weight, metadata, created_at, tenant_id
             FROM edges
             WHERE tenant_id = ?
-              AND source_id IN ({placeholders})
-              AND target_id IN ({placeholders})
+              AND (source_id IN ({placeholders}) OR target_id IN ({placeholders}))
             ORDER BY created_at ASC
             """,
             (self.tenant_id, *node_ids, *node_ids),

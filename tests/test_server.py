@@ -32,6 +32,8 @@ from waggle.server import (
     _write_other,
 )
 
+ABHI_FIXTURES = Path(__file__).parent / "fixtures" / "abhi"
+
 
 class FakeEmbeddingModel:
     model_name = "fake-model"
@@ -86,9 +88,20 @@ def make_app(tmp_path: Path) -> WaggleServer:
     return WaggleServer(graph=graph, config=config)
 
 
+def _seed_transcript_fixture(app: WaggleServer, fixture_name: str) -> None:
+    payload = json.loads((ABHI_FIXTURES / fixture_name).read_text(encoding="utf-8"))
+    app.graph.observe_conversation(
+        user_message=payload["user_message"],
+        assistant_response=payload["assistant_response"],
+        project=payload.get("project", ""),
+        session_id=payload.get("session_id", ""),
+        agent_id=payload.get("agent_id", ""),
+    )
+
+
 def write_waggle_codex_config(home: Path, db_path: Path) -> None:
     codex_dir = home / ".codex"
-    codex_dir.mkdir(parents=True)
+    codex_dir.mkdir(parents=True, exist_ok=True)
     normalized_db_path = db_path.as_posix()
     (codex_dir / "config.toml").write_text(
         "\n".join(
@@ -189,8 +202,11 @@ def test_parser_accepts_graph_editor_commands() -> None:
         ["checkpoint-context", "--project", "MCP", "--session-id", "thread-1", "--output", "handoff.abhi"]
     )
     clear_session_args = parser.parse_args(["clear-session", "--session-id", "thread-1", "--yes"])
+    clear_session_dry_run_args = parser.parse_args(["clear-session", "--session-id", "thread-1", "--dry-run"])
     clear_project_args = parser.parse_args(["clear-project", "--project", "MCP", "--yes"])
+    clear_project_dry_run_args = parser.parse_args(["clear-project", "--project", "MCP", "--dry-run"])
     clear_all_args = parser.parse_args(["clear-all", "--yes"])
+    clear_all_dry_run_args = parser.parse_args(["clear-all", "--dry-run"])
     doctor_json_args = parser.parse_args(["doctor", "--json"])
     push_args = parser.parse_args(["push", "--client-secret-path", "client.json", "--folder-id", "folder123"])
     pull_args = parser.parse_args(["pull", "file123", "--client-secret-path", "client.json"])
@@ -230,11 +246,14 @@ def test_parser_accepts_graph_editor_commands() -> None:
     assert clear_session_args.command == "clear-session"
     assert clear_session_args.session_id == "thread-1"
     assert clear_session_args.yes is True
+    assert clear_session_dry_run_args.dry_run is True
     assert clear_project_args.command == "clear-project"
     assert clear_project_args.project == "MCP"
     assert clear_project_args.yes is True
+    assert clear_project_dry_run_args.dry_run is True
     assert clear_all_args.command == "clear-all"
     assert clear_all_args.yes is True
+    assert clear_all_dry_run_args.dry_run is True
     assert doctor_json_args.command == "doctor"
     assert doctor_json_args.json_output is True
     assert push_args.command == "push"
@@ -244,6 +263,13 @@ def test_parser_accepts_graph_editor_commands() -> None:
     assert pull_args.file_ref == "file123"
     assert share_args.command == "share"
     assert share_args.file_ref == "file123"
+
+    doctor_json_args = parser.parse_args(["doctor", "--json"])
+    doctor_as_json_args = parser.parse_args(["doctor", "--as-json"])
+    assert doctor_json_args.command == "doctor"
+    assert doctor_json_args.json_output is True
+    assert doctor_as_json_args.command == "doctor"
+    assert doctor_as_json_args.json_output is True
 
 
 def test_run_doctor_has_single_invocation_site() -> None:
@@ -259,10 +285,15 @@ def test_run_doctor_has_single_invocation_site() -> None:
 
 
 def test_doctor_flags_mixed_embedding_model_ids(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    mock_config = tmp_path / "mock_config.json"
+    mock_config.write_text(json.dumps({"mcpServers": {"waggle": {}}}))
+    monkeypatch.setattr("waggle.server._KNOWN_CONFIG_PATHS", [("Mock Client", str(mock_config))])
     db_path = tmp_path / "server-memory.db"
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     write_waggle_codex_config(tmp_path, db_path)
     graph = MemoryGraph(db_path, FakeEmbeddingModel())
     graph.observe_conversation(
@@ -311,10 +342,15 @@ def test_doctor_flags_mixed_embedding_model_ids(
 
 
 def test_doctor_fix_reembeds_mixed_embedding_model_ids(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    mock_config = tmp_path / "mock_config.json"
+    mock_config.write_text(json.dumps({"mcpServers": {"waggle": {}}}))
+    monkeypatch.setattr("waggle.server._KNOWN_CONFIG_PATHS", [("Mock Client", str(mock_config))])
     db_path = tmp_path / "server-memory.db"
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     write_waggle_codex_config(tmp_path, db_path)
     graph = MemoryGraph(db_path, FakeEmbeddingModel())
     graph.observe_conversation(
@@ -906,12 +942,7 @@ def test_export_validate_inspect_and_import_abhi_tools(tmp_path: Path) -> None:
 
 def test_export_abhi_tool_refuses_likely_secrets_without_force(tmp_path: Path) -> None:
     app = make_app(tmp_path)
-    app.graph.observe_conversation(
-        user_message="My token is sk-abcdefghijklmnopqrstuvwxyz123456.",
-        assistant_response="I will not repeat the token.",
-        session_id="secret-session",
-        project="security",
-    )
+    _seed_transcript_fixture(app, "secret-scan-refusal.json")
 
     refused = app.handle_tool_call(
         "export_abhi",
@@ -926,6 +957,19 @@ def test_export_abhi_tool_refuses_likely_secrets_without_force(tmp_path: Path) -
     assert "appear to contain secrets" in refused.content[0].text
     assert forced.isError is False
     assert Path(forced.structuredContent["output_path"]).exists()
+
+
+def test_export_abhi_tool_allows_false_positive_adjacent_text_without_force(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    _seed_transcript_fixture(app, "secret-scan-safe.json")
+
+    exported = app.handle_tool_call(
+        "export_abhi",
+        {"output_path": str(tmp_path / "safe.abhi"), "project": "security"},
+    )
+
+    assert exported.isError is False
+    assert Path(exported.structuredContent["output_path"]).exists()
 
 
 def test_diff_and_merge_abhi_tools(tmp_path: Path) -> None:
@@ -1641,11 +1685,11 @@ def test_default_graph_uses_sqlite_backend_by_default(tmp_path: Path, monkeypatc
 def test_default_graph_uses_home_scoped_sqlite_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("WAGGLE_BACKEND", raising=False)
     monkeypatch.delenv("WAGGLE_DB_PATH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
-    # Set WAGGLE_DB_PATH directly to avoid Path.home() issues
     expected_db = tmp_path / ".waggle" / "waggle.db"
-    monkeypatch.setenv("WAGGLE_DB_PATH", str(expected_db))
-
     graph = _default_graph()
 
     assert isinstance(graph, MemoryGraph)
@@ -1710,6 +1754,7 @@ def test_default_graph_requires_neo4j_connection_settings(monkeypatch: pytest.Mo
 
 def test_write_other_config_no_longer_uses_pythonpath(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
 
     config_path = _write_other(str(tmp_path / "memory.db"), "/tmp/fake-python")
     contents = config_path.read_text()
@@ -1722,6 +1767,7 @@ def test_write_other_config_no_longer_uses_pythonpath(monkeypatch: pytest.Monkey
 
 def test_write_codex_config_no_longer_uses_pythonpath(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
     config_path = _write_codex(str(tmp_path / "memory.db"), "/tmp/fake-python")
@@ -1750,6 +1796,7 @@ def test_setup_client_arg_normalization() -> None:
 
 def test_write_gemini_config_preserves_existing_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     settings_file = tmp_path / ".gemini" / "settings.json"
     settings_file.parent.mkdir(parents=True)
@@ -1767,6 +1814,7 @@ def test_write_gemini_config_preserves_existing_settings(monkeypatch: pytest.Mon
 
 def test_write_antigravity_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
     config_path = _write_antigravity(str(tmp_path / "memory.db"), "/tmp/fake-python")
@@ -1779,6 +1827,7 @@ def test_write_antigravity_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
 
 def test_run_setup_writes_codex_config_and_agents(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     monkeypatch.chdir(tmp_path)
 
@@ -1805,6 +1854,7 @@ def test_write_codex_config_updates_existing_file_without_duplicates(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     config_file = tmp_path / ".codex" / "config.toml"
     config_file.parent.mkdir(parents=True)
@@ -1829,7 +1879,8 @@ def test_write_codex_config_updates_existing_file_without_duplicates(
     assert '[mcp_servers.playwright]\ncommand = "npx"' in contents
     assert 'command = "waggle-mcp"' in contents
     assert 'args = ["serve", "--transport", "stdio"]' in contents
-    assert f'WAGGLE_DB_PATH = "{tmp_path / "memory.db"}"' in contents
+    expected_db_path = str(tmp_path / "memory.db").replace("\\", "\\\\")
+    assert f'WAGGLE_DB_PATH = "{expected_db_path}"' in contents
     assert "/old/python" not in contents
     assert "/old/memory.db" not in contents
 
@@ -1900,3 +1951,114 @@ def test_write_codex_agents_updates_existing_block_without_duplication(tmp_path:
     assert "Keep this note." in contents
     assert AUTOMATIC_MEMORY_RULE_TEXT.strip() in contents
     assert "build_context before answers and on_assistant_turn after answers" in contents
+
+
+def test_clear_tools_dry_run_preview(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+
+    app.graph.add_node(
+        label="Vault Decision",
+        content="Export this node to a markdown vault.",
+        node_type=NodeType.DECISION,
+        project="alpha",
+        session_id="sess-1",
+    )
+    app.graph.observe_conversation(
+        user_message="Use Redis for caching.",
+        assistant_response="Noted.",
+        project="alpha",
+        session_id="sess-1",
+    )
+
+    # 1. Test clear_session with dry_run=True (without confirm!)
+    result = app.handle_tool_call("clear_session", {"session_id": "sess-1", "dry_run": True})
+    assert result.isError is False
+    assert result.structuredContent["dry_run"] is True
+    assert result.structuredContent["deleted_nodes"] > 0
+    assert result.structuredContent["deleted_transcripts"] > 0
+    # Should contain counts_by_node_type
+    assert any(k in result.structuredContent["counts_by_node_type"] for k in ("decision", "note", "entity", "fact"))
+    # Check text content prefix
+    assert "[Preview] Would clear" in result.content[0].text
+
+    # Verify data still exists
+    assert app.graph.get_stats().total_nodes > 0
+    # Verify no audit event
+    assert len(app.graph.list_audit_events(event_type="graph.scope_cleared")) == 0
+
+    # 2. Test clear_project with dry_run=True
+    result_proj = app.handle_tool_call("clear_project", {"project": "alpha", "dry_run": True})
+    assert result_proj.isError is False
+    assert result_proj.structuredContent["dry_run"] is True
+    assert result_proj.structuredContent["deleted_nodes"] > 0
+    assert "[Preview] Would clear" in result_proj.content[0].text
+
+    # 3. Test clear_all with dry_run=True
+    result_all = app.handle_tool_call("clear_all", {"dry_run": True})
+    assert result_all.isError is False
+    assert result_all.structuredContent["dry_run"] is True
+    assert result_all.structuredContent["deleted_nodes"] > 0
+    assert "[Preview] Would clear" in result_all.content[0].text
+
+
+def test_clear_cli_commands_dry_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    app = make_app(tmp_path)
+
+    app.graph.add_node(
+        label="Test Node",
+        content="Use Redis for caching.",
+        node_type=NodeType.DECISION,
+        project="alpha",
+        session_id="sess-1",
+    )
+    app.graph.observe_conversation(
+        user_message="Use Redis for caching.",
+        assistant_response="Noted.",
+        project="alpha",
+        session_id="sess-1",
+    )
+
+    # Run clear-session with dry-run
+    args = SimpleNamespace(
+        command="clear-session",
+        session_id="sess-1",
+        dry_run=True,
+        yes=False,
+    )
+    exit_code = _run_admin_command(app.config, args)
+    assert exit_code == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["deleted_nodes"] > 0
+    assert payload["deleted_transcripts"] > 0
+
+    # Verify data is not deleted
+    assert app.graph.get_stats().total_nodes > 0
+
+    # Run clear-project with dry-run
+    args = SimpleNamespace(
+        command="clear-project",
+        project="alpha",
+        dry_run=True,
+        yes=False,
+    )
+    exit_code = _run_admin_command(app.config, args)
+    assert exit_code == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["deleted_nodes"] > 0
+
+    # Run clear-all with dry-run
+    args = SimpleNamespace(
+        command="clear-all",
+        dry_run=True,
+        yes=False,
+    )
+    exit_code = _run_admin_command(app.config, args)
+    assert exit_code == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["deleted_nodes"] > 0
