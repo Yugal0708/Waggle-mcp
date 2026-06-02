@@ -64,6 +64,7 @@ def _parse_float(name: str, value: str) -> float:
 
     return parsed
 
+
 @dataclass(slots=True)
 class AppConfig:
     backend: str
