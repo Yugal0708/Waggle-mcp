@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import contextlib
 import hashlib
 import heapq
 import json
@@ -875,8 +875,15 @@ class MemoryGraph:
         if pool is not None and getattr(self, "_owns_pool", False):
             pool.close()
 
-    def __del__(self) -> None:  # pragma: no cover - best-effort cleanup
-        with suppress(Exception):
+    def __enter__(self) -> MemoryGraph:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # Best-effort cleanup; never raise from a finalizer.
+        with contextlib.suppress(Exception):  # pragma: no cover - defensive finalizer guard
             self.close()
 
     def _connect(self, timeout: float = 30.0, *, check_same_thread: bool = True) -> sqlite3.Connection:
