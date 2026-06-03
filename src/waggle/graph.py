@@ -124,6 +124,7 @@ from waggle.models import (
     ReplayHit,
     RetentionPolicyRecord,
     RetentionPruneRunRecord,
+    ScoredNodeView,
     SubgraphResult,
     TenantRecord,
     TimelineResult,
@@ -755,15 +756,16 @@ class _ReadWriteLock:
         finally:
             self._release_read()
 
-    def _acquire_read(self) -> None:
+    def _acquire_read(self):
         tid = threading.get_ident()
         with self._cond:
             if self._write_owner == tid:
                 return
-            while self._write_owner is not None or self._waiting_writers > 0:
+            is_reentrant = self._reader_threads.get(tid, 0) > 0
+            while self._write_owner is not None or (self._waiting_writers > 0 and not is_reentrant):
                 self._cond.wait()
-            self._readers += 1
             self._reader_threads[tid] = self._reader_threads.get(tid, 0) + 1
+            self._readers += 1
 
     def _release_read(self) -> None:
         tid = threading.get_ident()
@@ -8060,7 +8062,6 @@ class MemoryGraph:
         # inside the comparator on every pair comparison (Timsort is O(N log N)).
         # Pairing keeps the Node→view association 1:1 so we don't need a dict
         # round-trip or duplicate-id safety nets in the result construction.
-        from waggle.models import ScoredNodeView
 
         view_node_pairs: list[tuple[ScoredNodeView, Node]] = [
             (

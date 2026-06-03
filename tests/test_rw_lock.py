@@ -47,12 +47,14 @@ class TestWriteLock:
 
         a_inside = threading.Event()
         _orig_worker = worker
+
         def worker_a(label: str, hold: float) -> None:
             with lock:
                 a_inside.set()
                 log.append(f"{label}_in")
                 time.sleep(hold)
                 log.append(f"{label}_out")
+
         t1 = _start(lambda: worker_a("A", 0.05))
         a_inside.wait(timeout=2)
         t2 = _start(lambda: worker("B", 0.05))
@@ -316,9 +318,11 @@ class TestIssue67:
         """
         lock = _ReadWriteLock()
         b_read_ok = threading.Event()
+        a_inside = threading.Event()
 
         def thread_a() -> None:
             with lock.read():
+                a_inside.set()
                 try:
                     with lock:
                         pass
@@ -329,27 +333,48 @@ class TestIssue67:
             with lock.read():
                 b_read_ok.set()
 
-        a_inside = threading.Event()
-        b_can_start = threading.Event()
+        ta = _start(thread_a)
+        assert a_inside.wait(timeout=2), "Thread A did not enter its read lock"
 
-        def thread_c() -> None:
-            with lock.read():
-                a_inside.set()
-                b_can_start.wait(timeout=2)
-                try:
-                    with lock:
-                        pass
-                except RuntimeError:
-                    pass
+        tb = _start(thread_b)
+        assert b_read_ok.wait(timeout=2), "Thread B could not acquire read lock"
 
-        def thread_d() -> None:
+        ta.join(timeout=2)
+        tb.join(timeout=2)
+
+    def test_reentrant_read_bypasses_waiting_writer(self):
+        """
+        A thread holding a read lock must be able to re-enter a read lock (nested read)
+        even if a writer thread is waiting in the queue, preventing self-deadlock.
+        """
+        lock = _ReadWriteLock()
+        a_has_first_read = threading.Event()
+        b_waiting_for_write = threading.Event()
+        a_nested_read_ok = threading.Event()
+
+        def thread_a() -> None:
             with lock.read():
-                b_read_ok.set()
+                a_has_first_read.set()
+                assert b_waiting_for_write.wait(timeout=2)
+
+                time.sleep(0.02)
+
+                with lock.read():
+                    a_nested_read_ok.set()
+
+        def thread_b() -> None:
+            b_waiting_for_write.set()
+            with lock:
+                pass
 
         ta = _start(thread_a)
-        a_inside.wait(timeout=2)
+        assert a_has_first_read.wait(timeout=2), "Thread A failed to acquire initial read"
+
         tb = _start(thread_b)
-        b_can_start.set()
-        assert b_read_ok.wait(timeout=2), "Thread B could not acquire read lock"
+
+        assert a_nested_read_ok.wait(timeout=2), (
+            "Thread A self-deadlocked on re-entrant read because a writer was waiting!"
+        )
+
         ta.join(timeout=2)
         tb.join(timeout=2)
