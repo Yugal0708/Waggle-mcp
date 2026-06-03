@@ -993,3 +993,12 @@ class MergeStrategyConfig(BaseModel):
         except Exception:
             pass
         return cls()
+
+
+class ScoredNodeView(BaseModel):
+    """Lightweight view of a node used to optimize sorting performance."""
+
+    node_id: str
+    updated_at_ts: float
+    final_score: float
+    label_lower: str

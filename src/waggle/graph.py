@@ -10,7 +10,7 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -690,20 +690,14 @@ def _normalized_content_hash(text: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# _ReadWriteLock — pure-Python reader/writer lock (no extra dependencies)
-# ---------------------------------------------------------------------------
-# Allows concurrent reads while serialising writes.  Replaces the single
-# threading.RLock that previously serialised ALL access — including reads that
-# could safely run in parallel.
-#
-# Usage (mirrors threading.RLock context manager contract):
-#   with graph._lock:          # write — exclusive
-#       ...
-#   with graph._read_lock():   # read  — shared (multiple allowed)
-#       ...
-# ---------------------------------------------------------------------------
 class _ReadWriteLock:
+    """A pure-Python reader/writer lock implementation.
+
+    Allows concurrent reads while serialising writes. Lock upgrades (acquiring a
+    write lock while already holding a read lock on the same thread) are strictly
+    prohibited to prevent self-deadlock and will raise a RuntimeError.
+    """
+
     def __init__(self) -> None:
         self._cond = threading.Condition(threading.Lock())
         self._readers: int = 0
@@ -712,7 +706,7 @@ class _ReadWriteLock:
         self._write_depth: int = 0
         self._reader_threads: dict[int, int] = {}
 
-    def __enter__(self) -> "_ReadWriteLock":
+    def __enter__(self) -> _ReadWriteLock:
         self._acquire_write()
         return self
 
@@ -750,7 +744,7 @@ class _ReadWriteLock:
                 self._write_owner = None
                 self._cond.notify_all()
 
-    def read(self) -> "contextmanager":
+    def read(self) -> contextmanager:
         return self._read_context()
 
     @contextmanager
@@ -784,6 +778,8 @@ class _ReadWriteLock:
             self._readers -= 1
             if self._readers == 0:
                 self._cond.notify_all()
+
+
 class MemoryGraph:
     """SQLite-backed graph memory with embedding-assisted retrieval."""
 
@@ -8064,6 +8060,8 @@ class MemoryGraph:
         # inside the comparator on every pair comparison (Timsort is O(N log N)).
         # Pairing keeps the Node→view association 1:1 so we don't need a dict
         # round-trip or duplicate-id safety nets in the result construction.
+        from waggle.models import ScoredNodeView
+
         view_node_pairs: list[tuple[ScoredNodeView, Node]] = [
             (
                 ScoredNodeView(
