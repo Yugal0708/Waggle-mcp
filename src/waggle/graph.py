@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import contextlib
 import hashlib
 import heapq
@@ -11,7 +12,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Iterable
-from contextlib import nullcontext, suppress
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
