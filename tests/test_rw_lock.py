@@ -27,11 +27,27 @@ from waggle.graph import _ReadWriteLock
 
 
 def _start(fn, *, daemon: bool = True) -> threading.Thread:
-    """Start *fn* in a thread and return it."""
-    t = threading.Thread(target=fn, daemon=daemon)
+    """Start *fn* in a thread and return it (exceptions are re-raised on join)."""
+    exc_box: list[BaseException] = []
+
+    def wrapper() -> None:
+        try:
+            fn()
+        except Exception as exc:
+            exc_box.append(exc)
+
+    t = threading.Thread(target=wrapper, daemon=daemon)
+    t._exc_box = exc_box
     t.start()
     return t
 
+def _join(t: threading.Thread, timeout: float = 2) -> None:
+    """Join *t* and re-raise any exception it captured."""
+    t.join(timeout=timeout)
+    assert not t.is_alive(), f"Thread {t.name} is still alive after {timeout}s"
+    exc_box = getattr(t, "_exc_box", [])
+    if exc_box:
+        raise exc_box[0]
 
 class TestWriteLock:
     def test_exclusive_between_threads(self):
@@ -376,5 +392,5 @@ class TestIssue67:
             "Thread A self-deadlocked on re-entrant read because a writer was waiting!"
         )
 
-        ta.join(timeout=2)
-        tb.join(timeout=2)
+        _join(ta)
+        _join(tb)
