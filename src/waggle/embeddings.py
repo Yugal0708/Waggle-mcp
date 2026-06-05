@@ -48,24 +48,19 @@ class EmbeddingModel:
 
     _DETERMINISTIC_MODELS = {"fake", "fake-model", "deterministic", "offline-demo"}
 
+    _GLOBAL_EMBED_CACHE: OrderedDict[tuple[str, str], bytes] = OrderedDict()
+    _GLOBAL_EMBED_CACHE_MAXSIZE = 512
+    _GLOBAL_EMBED_CACHE_LOCK = threading.Lock()
 
     def __init__(
         self,
         model_name: str = "all-MiniLM-L6-v2",
         embedding_backend: str = "pytorch",
     ) -> None:
-
-    _GLOBAL_EMBED_CACHE: OrderedDict[tuple[str, str], bytes] = OrderedDict()
-    _GLOBAL_EMBED_CACHE_MAXSIZE = 512
-    _GLOBAL_EMBED_CACHE_LOCK = threading.Lock()
-
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2") -> None:
-
         self.model_name = model_name
         self._model: Any | None = None
         self.embedding_backend = embedding_backend
         self._fallback_to_deterministic = False
-
         # --- background-warmup state ---
         self._lock = threading.Lock()
         self._ready_event = threading.Event()
