@@ -1,7 +1,7 @@
 [mcp_servers.waggle]
 command = "waggle-mcp"
-args = ["serve"]
-env = { WAGGLE_TRANSPORT = "stdio", WAGGLE_BACKEND = "sqlite", WAGGLE_DB_PATH = "~/.waggle/waggle.db", WAGGLE_DEFAULT_TENANT_ID = "local-default", WAGGLE_MODEL = "all-MiniLM-L6-v2" }
+args = ["serve", "--transport", "stdio"]
+env = { WAGGLE_BACKEND = "sqlite", WAGGLE_DB_PATH = "~/.waggle/waggle.db", WAGGLE_DEFAULT_TENANT_ID = "local-default", WAGGLE_MODEL = "all-MiniLM-L6-v2" }
 
 # Add this to your Codex global/project instructions so Waggle is used automatically:
 #

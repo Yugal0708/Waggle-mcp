@@ -23,9 +23,8 @@ Add Waggle to `~/.codex/config.toml`:
 ```toml
 [mcp_servers.waggle]
 command = "waggle-mcp"
-args = ["serve"]
+args = ["serve", "--transport", "stdio"]
 env = {
-  WAGGLE_TRANSPORT = "stdio",
   WAGGLE_BACKEND = "sqlite",
   WAGGLE_DB_PATH = "~/.waggle/waggle.db",
   WAGGLE_DEFAULT_TENANT_ID = "local-default",
