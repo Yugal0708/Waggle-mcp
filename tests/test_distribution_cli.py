@@ -44,6 +44,7 @@ def test_distribution_commands_present_in_help(capsys):
     for command in ("export", "push", "pull", "share"):
         assert command in output
 
+
 @pytest.mark.parametrize(
     ("command", "expected_flags"),
     [
@@ -84,7 +85,6 @@ def test_distribution_commands_present_in_help(capsys):
         ),
     ],
 )
-
 def test_distribution_command_help_contains_expected_flags(
     command: str,
     expected_flags: list[str],
@@ -99,7 +99,7 @@ def test_distribution_command_help_contains_expected_flags(
 
     for flag in expected_flags:
         assert flag in output, f"Expected flag {flag!r} missing from `{command} --help`"
-        
+
 
 def test_write_codex_config_uses_packaged_stdio_command(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
