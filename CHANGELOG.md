@@ -38,7 +38,7 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Default / unset / `"true"` → enforcement **active** (new behaviour).
   - `"false"` → enforcement **disabled** (legacy behaviour: expired nodes
     appear in default queries). A deprecation warning is logged.
-  - **This flag will be removed in the next minor release.**
+  - **This flag will be removed in the next release.**
 
 ---
 
@@ -53,9 +53,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Claude Desktop bundle**: `claude-desktop-extension.mcpb` distributed via
   GitHub Releases.
 - Claude Code one-liner install:
-- pipx install waggle-mcp
-- 
-claude mcp add --transport stdio waggle -- waggle-mcp serve --transport stdio
+```bash
+  pipx install waggle-mcp
+  claude mcp add --transport stdio waggle -- waggle-mcp serve --transport stdio
+```
 - VS Code Marketplace listing: **Waggle: Local Memory for AI Agents**.
 
 ### Links
@@ -81,6 +82,7 @@ claude mcp add --transport stdio waggle -- waggle-mcp serve --transport stdio
 
 ### Links
 - [Release notes](https://github.com/Abhigyan-Shekhar/Waggle-mcp/releases/tag/v0.1.12)
+- [PyPI](https://pypi.org/project/waggle-mcp/0.1.12/)
 
 ---
 
