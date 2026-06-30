@@ -58,7 +58,7 @@ print(rlm.completion("Print me the first 100 powers of two, each on a newline.")
 <summary><b>Manual Setup</b></summary>
 
 Set up the dependencies with `uv` (or your virtual environment of choice):
-```bash
+```bash/bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv init && uv venv --python 3.12  # change version as needed
 uv pip install -e .
