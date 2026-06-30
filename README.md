@@ -4,7 +4,7 @@
 
 <p align="center">
   <strong>Persistent memory that remembers decisions, reasons, and contradictions across sessions.</strong><br/>
-  Your AI forgets everything when the context window closes. Waggle gives it a graph-backed brain that persists.
+  Your AI forgets everything when the context window closes. Waggle gives it a graph-backed brain that persists...
 </p>
 
 <p align="center">
