@@ -23,7 +23,7 @@
 
 ## Core
 
-This repository is the public Waggle product repo: Apache-2.0 licensed, available on GitHub and PyPI, and focused on the local-first memory engine.
+This repository is the public Waggle product repo: Apache-2.0 licensed, available on GitHub and PyPI, and focused on the local-first memory engine...
 
 ## Tech Stack
 
